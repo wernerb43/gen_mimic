@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 from isaaclab.utils.math import matrix_from_quat, subtract_frame_transforms
 
-from whole_body_tracking.tasks.tracking.mdp.commands import MotionCommand
+from whole_body_tracking.tasks.tracking.mdp.commands import MotionCommand, TargetPositionCommand
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
@@ -81,3 +81,21 @@ def motion_anchor_ori_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor
     )
     mat = matrix_from_quat(ori)
     return mat[..., :2].reshape(mat.shape[0], -1)
+
+
+def target_pos_w(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    """Target position in world frame."""
+    command: TargetPositionCommand = env.command_manager.get_term(command_name)
+    return command.target_position_w
+
+
+def target_body_pos_w(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    """Current position of the target body in world frame."""
+    command: TargetPositionCommand = env.command_manager.get_term(command_name)
+    return command.target_body_pos_w
+
+
+def target_pos_error_w(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    """Position error in world frame (target position - current body position)."""
+    command: TargetPositionCommand = env.command_manager.get_term(command_name)
+    return command.target_position_w - command.target_body_pos_w

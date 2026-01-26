@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from dataclasses import MISSING
 from typing import TYPE_CHECKING
 
+import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
 from isaaclab.managers import CommandTerm, CommandTermCfg
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
@@ -25,6 +26,100 @@ from isaaclab.utils.math import (
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
+
+"""The position command: commanded position of a single body (e.g., end effector or base for throwing/catching)"""
+class TargetPositionCommand(CommandTerm):
+    cfg: TargetPositionCommandCfg
+
+    def __init__(self, cfg: TargetPositionCommandCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+
+        self.robot: Articulation = env.scene[cfg.asset_name]
+        print('body names:')
+        print(self.robot.body_names)
+        self.target_body_index = self.robot.body_names.index(self.cfg.target_body_name)
+        
+        # Target position in world frame
+        self.target_position_w = torch.zeros(self.num_envs, 3, device=self.device)
+        
+        # Initialize metrics
+        self.metrics["error_target_pos"] = torch.zeros(self.num_envs, device=self.device)
+
+    @property
+    def command(self) -> torch.Tensor:
+        """Returns the target position as the command."""
+        return self.target_position_w
+
+    @property
+    def target_body_pos_w(self) -> torch.Tensor:
+        """Current position of the target body in world frame."""
+        return self.robot.data.body_pos_w[:, self.target_body_index]
+    
+    def _update_metrics(self):
+        """Update tracking error: distance between target body position and target position."""
+        self.metrics["error_target_pos"] = torch.norm(self.target_body_pos_w - self.target_position_w, dim=-1)
+
+    def _resample_command(self, env_ids: Sequence[int]):
+        """Resample target position with random values within specified range."""
+        if len(env_ids) == 0:
+            return
+        
+        # Sample target position within specified range
+        range_list = [self.cfg.target_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z"]]
+        ranges = torch.tensor(range_list, device=self.device)
+        rand_samples = sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 3), device=self.device)
+        
+        # Set target position in world frame (relative to env origin)
+        self.target_position_w[env_ids] = rand_samples + self._env.scene.env_origins[env_ids]
+
+    def _update_command(self):
+        """Update command each step - no changes needed for static targets."""
+        pass
+
+    def _set_debug_vis_impl(self, debug_vis: bool):
+        """Enable/disable debug visualization."""
+        if debug_vis:
+            if not hasattr(self, "target_visualizer"):
+                # Create sphere marker for target position visualization
+                marker_cfg = VisualizationMarkersCfg(
+                    prim_path="/Visuals/Command/target_position",
+                    markers={
+                        "sphere": sim_utils.SphereCfg(
+                            radius=0.05,
+                            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0))
+                        )
+                    },
+                )
+                self.target_visualizer = VisualizationMarkers(marker_cfg)
+            self.target_visualizer.set_visibility(True)
+        else:
+            if hasattr(self, "target_visualizer"):
+                self.target_visualizer.set_visibility(False)
+
+    def _debug_vis_callback(self, event):
+        """Callback for debug visualization - draw sphere at target position."""
+        if not self.robot.is_initialized:
+            return
+        # Visualize target position as a sphere (no orientation needed)
+        # Use identity rotation for the visualization
+        identity_quat = torch.zeros(self.num_envs, 4, device=self.device)
+        identity_quat[:, 0] = 1.0
+        self.target_visualizer.visualize(self.target_position_w, identity_quat)
+
+@configclass
+class TargetPositionCommandCfg(CommandTermCfg):
+    """Configuration for the target position command."""
+
+    class_type: type = TargetPositionCommand
+
+    asset_name: str = MISSING
+    """Name of the robot asset in the scene."""
+
+    target_body_name: str = MISSING
+    """Name of the body/link that should reach the target position (e.g., 'left_hand', 'right_hand')."""
+
+    target_range: dict[str, tuple[float, float]] = {"x": (0.0, 0.5), "y": (-0.3, 0.3), "z": (0.0, 0.5)}
+    """Range for sampling target positions (x, y, z) in meters."""
 
 
 class MotionLoader:
@@ -57,7 +152,7 @@ class MotionLoader:
     def body_ang_vel_w(self) -> torch.Tensor:
         return self._body_ang_vel_w[:, self._body_indexes]
 
-
+"""The motion command: joint positions and velocities of target motion"""
 class MotionCommand(CommandTerm):
     cfg: MotionCommandCfg
 

@@ -7,7 +7,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import quat_error_magnitude
 
-from whole_body_tracking.tasks.tracking.mdp.commands import MotionCommand
+from whole_body_tracking.tasks.tracking.mdp.commands import MotionCommand, TargetPositionCommand
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -80,3 +80,10 @@ def feet_contact_time(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, thresh
     last_contact_time = contact_sensor.data.last_contact_time[:, sensor_cfg.body_ids]
     reward = torch.sum((last_contact_time < threshold) * first_air, dim=-1)
     return reward
+
+
+def target_position_error_exp(env: ManagerBasedRLEnv, command_name: str, std: float) -> torch.Tensor:
+    """Exponential reward for target position tracking error."""
+    command: TargetPositionCommand = env.command_manager.get_term(command_name)
+    error = torch.sum(torch.square(command.target_position_w - command.target_body_pos_w), dim=-1)
+    return torch.exp(-error / std**2)
