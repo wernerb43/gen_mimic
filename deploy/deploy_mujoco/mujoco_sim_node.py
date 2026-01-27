@@ -62,31 +62,9 @@ class MujocoSimNode(Node):
         with open(f"{G1_RL_ROOT_DIR}/deploy/configs/{self.config_file}") as f:
             config = yaml.load(f, Loader=yaml.FullLoader)
         self.simulation_dt = config["simulation_dt"]
-        # self.num_actions = config["num_actions"]
-        # self.num_obs = config["num_obs"]
-        # self.joint_ids = config.get("joint_ids", list(range(self.num_actions)))
-        # self.default_angles = np.array(config["default_angles"], dtype=np.float32)[
-        #     self.joint_ids
-        # ]
-        # self.dof_pos_scale = config["dof_pos_scale"]
-        # self.dof_vel_scale = config["dof_vel_scale"]
-        # self.ang_vel_scale = config["ang_vel_scale"]
-        # self.cmd_scale = np.array(config["cmd_scale"], dtype=np.float32)
-        # self.action_scale = config["action_scale"]
-        # self.policy_path = config["policy_path"].replace(
-        #     "{G1_RL_ROOT_DIR}", G1_RL_ROOT_DIR
-        # )
+
         self.xml_path = config["xml_path"].replace("{G1_RL_ROOT_DIR}", G1_RL_ROOT_DIR)
 
-        self.grid_size_x = float(config["grid_size_x"])
-        self.grid_size_y = float(config["grid_size_y"])
-        self.resolution = float(config["resolution"])
-        self.forward_offset = float(config["forward_offset"])
-        self.grid_points_x = int(config["grid_points_x"])
-        self.grid_points_y = int(config["grid_points_y"])
-        self.N_grid_points = int(config["N_grid_points"])
-        self.height_offset = float(config.get("height_offset", 0.5))
-        # self.isaac_mujoco_conversion = config.get("isaac_mujoco_conversion", False)
 
     def init_sim(self):
         self.m = mujoco.MjModel.from_xml_path(self.xml_path)

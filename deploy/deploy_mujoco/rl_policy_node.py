@@ -71,6 +71,8 @@ class RLPolicyNode(Node):
         # Load policy if desired (may be TorchScript); it's optional — node works without it.
         self.load_policy()
         self.load_policy_metadata()
+        # Load motion trajectory from npz file if provided
+        self.load_motion_trajectory()
 
         # timer uses control_dt from YAML (simulation_dt * control_decimation)
         self.timer = self.create_timer(self.control_dt, self.policy_step)
@@ -181,6 +183,11 @@ class RLPolicyNode(Node):
         self.max_cmd = np.array(
             config.get("max_cmd", [1.0, 1.0, 1.0]), dtype=np.float32
         )
+
+        # motion trajectory npz file
+        self.motion_npz_path = config.get("motion_npz_path", "")
+        if self.motion_npz_path:
+            self.motion_npz_path = self.motion_npz_path.replace("{G1_RL_ROOT_DIR}", G1_RL_ROOT_DIR)
 
     def control_enable_callback(self, msg: Float64):
         try:
@@ -406,6 +413,42 @@ class RLPolicyNode(Node):
                 f"Failed to load or validate ONNX model at '{self.policy_path}': {e}"
             )
 
+    def load_motion_trajectory(self):
+        """
+        Load motion trajectory from npz file. The npz file should contain:
+        - fps: output fps of the motion
+        - joint_pos: shape (T, num_joints)
+        - joint_vel: shape (T, num_joints)
+        - body_pos_w: shape (T, num_bodies, 3)
+        - body_quat_w: shape (T, num_bodies, 4)
+        - body_lin_vel_w: shape (T, num_bodies, 3)
+        - body_ang_vel_w: shape (T, num_bodies, 3)
+        """
+        self.motion_trajectory = None
+        self.motion_frame_idx = 0
+        
+        if not self.motion_npz_path or self.motion_npz_path == "":
+            self.get_logger().info("No motion trajectory file specified, using zero placeholders")
+            return
+        
+        try:
+            if not os.path.exists(self.motion_npz_path):
+                self.get_logger().warn(f"Motion npz file not found: {self.motion_npz_path}")
+                return
+            
+            self.motion_trajectory = np.load(self.motion_npz_path)
+            motion_fps = self.motion_trajectory["fps"]
+            num_frames = self.motion_trajectory["joint_pos"].shape[0]
+            num_bodies = self.motion_trajectory["body_pos_w"].shape[1]
+            
+            self.get_logger().info(
+                f"Loaded motion trajectory from {self.motion_npz_path}: "
+                f"{num_frames} frames at {motion_fps} fps, {num_bodies} bodies"
+            )
+        except Exception as e:
+            self.get_logger().error(f"Failed to load motion trajectory: {e}")
+            self.motion_trajectory = None
+
     def _compute_traj_velocities(self, pos_traj, dt):
         """
         Compute per-frame joint velocities for a position trajectory pos_traj (T, num_joints).
@@ -562,6 +605,12 @@ class RLPolicyNode(Node):
                     ]
                 ).tolist()
                 self.action_pub.publish(msg)
+                
+                # Increment motion frame index (if trajectory is loaded)
+                if self.motion_trajectory is not None:
+                    num_frames = self.motion_trajectory["joint_pos"].shape[0]
+                    self.motion_frame_idx = (self.motion_frame_idx + 1) % num_frames
+                
                 return
             except Exception as e:
                 # ONNX inference failed; fall back to IK-first-frame or default
@@ -635,22 +684,106 @@ class RLPolicyNode(Node):
                 out[onnx_idx] = arr[xml_idx]
         return out
 
+
     def obs_command(self):
-        # Map high-level velocity command into a 6D vector matching tracking env command order.
-        # Layout: [vx, vy, vz, roll, pitch, yaw]. Only vx, vy, yaw are provided; others are zeroed.
-        cmd = np.zeros(6, dtype=np.float32)
-        cmd[0] = float(self.cmd[0]) if len(self.cmd) > 0 else 0.0
-        cmd[1] = float(self.cmd[1]) if len(self.cmd) > 1 else 0.0
-        cmd[5] = float(self.cmd[2]) if len(self.cmd) > 2 else 0.0
-        return cmd
+        # Return motion trajectory command: [joint_pos (motion), joint_vel (motion)]
+        # This is the desired joint configuration and velocities from the motion being replayed
+        # Size: 2 * num_joints (e.g., 58 for 29-DOF robot)
+        if self.motion_trajectory is not None:
+            try:
+                joint_pos = self.motion_trajectory["joint_pos"][self.motion_frame_idx]
+                joint_vel = self.motion_trajectory["joint_vel"][self.motion_frame_idx]
+                cmd = np.concatenate([joint_pos, joint_vel]).astype(np.float32)
+                return cmd
+            except Exception as e:
+                self.get_logger().warn(f"Error extracting motion command: {e}")
+        return np.zeros(2 * self.num_joints, dtype=np.float32)
 
     def obs_motion_anchor_pos_b(self):
-        # Anchor position in base frame not available from sim topics; return zeros placeholder.
+        # Return motion anchor body position error in robot base frame
+        # This is: motion_anchor_pos_w - robot_anchor_pos_w, transformed to robot base frame
+        if self.motion_trajectory is not None:
+            try:
+                # Anchor body is typically the first body (index 0, pelvis/base)
+                motion_anchor_pos = self.motion_trajectory["body_pos_w"][self.motion_frame_idx, 0]  # (3,)
+                
+                # Robot anchor position is the robot's current position
+                robot_anchor_pos = self.robot_position  # (3,)
+                
+                # Position difference in world frame
+                pos_error_w = motion_anchor_pos - robot_anchor_pos
+                
+                # Transform to robot base frame using quaternion
+                # q_inv rotates from world to body frame
+                q_inv = self._quat_conjugate(self.quat)
+                pos_error_b = self._quat_rotate(q_inv, pos_error_w)
+                
+                return pos_error_b.astype(np.float32)
+            except Exception as e:
+                self.get_logger().warn(f"Error computing motion anchor position: {e}")
         return np.zeros(3, dtype=np.float32)
 
     def obs_motion_anchor_ori_b(self):
-        # Anchor orientation in base frame not available; return zeros placeholder.
-        return np.zeros(3, dtype=np.float32)
+        # Return motion anchor body orientation error in robot base frame as 6D encoding
+        # Format: [r00, r01, r10, r11, r20, r21] - first two columns of 3x3 rotation matrix
+        if self.motion_trajectory is not None:
+            try:
+                # Get motion anchor orientation (first body, pelvis/base)
+                motion_anchor_quat = self.motion_trajectory["body_quat_w"][self.motion_frame_idx, 0]  # (4,) wxyz
+                
+                # Robot anchor orientation is the robot's current quaternion
+                robot_anchor_quat = self.quat  # (4,) wxyz
+                
+                # Compute relative quaternion: quat_error = quat_robot_inv * quat_motion
+                q_inv = self._quat_conjugate(robot_anchor_quat)
+                q_rel = self._quat_multiply(q_inv, motion_anchor_quat)
+                
+                # Convert quaternion to rotation matrix
+                rot_mat = self._quat_to_rotation_matrix(q_rel)
+                
+                # Extract 6D encoding: [r00, r01, r10, r11, r20, r21]
+                ori_6d = np.array([
+                    rot_mat[0, 0], rot_mat[0, 1],
+                    rot_mat[1, 0], rot_mat[1, 1],
+                    rot_mat[2, 0], rot_mat[2, 1]
+                ], dtype=np.float32)
+                
+                return ori_6d
+            except Exception as e:
+                self.get_logger().warn(f"Error computing motion anchor orientation: {e}")
+        return np.zeros(6, dtype=np.float32)
+
+    def _quat_conjugate(self, q: np.ndarray) -> np.ndarray:
+        """Compute quaternion conjugate. Input/output format: [w, x, y, z]"""
+        return np.array([q[0], -q[1], -q[2], -q[3]], dtype=np.float32)
+    
+    def _quat_multiply(self, q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+        """Multiply two quaternions. Input/output format: [w, x, y, z]"""
+        w1, x1, y1, z1 = q1
+        w2, x2, y2, z2 = q2
+        return np.array([
+            w1*w2 - x1*x2 - y1*y2 - z1*z2,
+            w1*x2 + x1*w2 + y1*z2 - z1*y2,
+            w1*y2 - x1*z2 + y1*w2 + z1*x2,
+            w1*z2 + x1*y2 - y1*x2 + z1*w2
+        ], dtype=np.float32)
+    
+    def _quat_rotate(self, q: np.ndarray, v: np.ndarray) -> np.ndarray:
+        """Rotate vector v by quaternion q. q format: [w, x, y, z]"""
+        # v' = q * v * q_inv where v is treated as [0, vx, vy, vz]
+        v_quat = np.array([0.0, v[0], v[1], v[2]], dtype=np.float32)
+        q_inv = self._quat_conjugate(q)
+        result = self._quat_multiply(q, self._quat_multiply(v_quat, q_inv))
+        return result[1:4]  # Return [x, y, z]
+    
+    def _quat_to_rotation_matrix(self, q: np.ndarray) -> np.ndarray:
+        """Convert quaternion to 3x3 rotation matrix. q format: [w, x, y, z]"""
+        w, x, y, z = q
+        return np.array([
+            [1 - 2*(y*y + z*z), 2*(x*y - w*z), 2*(x*z + w*y)],
+            [2*(x*y + w*z), 1 - 2*(x*x + z*z), 2*(y*z - w*x)],
+            [2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x*x + y*y)]
+        ], dtype=np.float32)
 
     def obs_base_lin_vel(self):
         return self.base_lin_vel
@@ -709,6 +842,7 @@ class RLPolicyNode(Node):
             if obs_val is None:
                 raise RuntimeError(f"Observation function '{func_name}' returned None.")
             obs_list.append(np.asarray(obs_val, dtype=np.float32))
+        print(obs_list)
         return np.concatenate(obs_list, axis=-1)
 
 

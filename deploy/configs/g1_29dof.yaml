@@ -3,9 +3,13 @@
 # policy_path: "/home/yangl/BeyondMimic/whole_body_tracking/logs/rsl_rl/g1_flat/2025-11-30_01-26-21_squat_walk_full/exported/policy.onnx"
 # policy_path: "/home/yangl/BeyondMimic/whole_body_tracking/logs/rsl_rl/g1_flat/2025-12-01_18-54-15_walk_0.75_fixed_arm/exported/policy.onnx"
 # policy_path: "/home/yangl/BeyondMimic/whole_body_tracking/logs/rsl_rl/g1_flat/2025-12-02_09-21-26_2025-12-01_18-54-15_walk_squat_rand_arm/exported/policy.onnx" 
-policy_path: "/home/blake/gen_mimic/logs/rsl_rl/g1_flat/2026-01-22_18-42-32_throw_run_3/2026-01-22_18-42-32_throw_run_3.onnx"
+policy_path: "/home/blake/gen_mimic/logs/rsl_rl/g1_flat/2026-01-27_10-53-58_throw_neutral_2_run/2026-01-27_10-53-58_throw_neutral_2_run.onnx"
 use_gpu: True
 plot_feet: False
+
+# Motion trajectory file (npz format from csv_to_npz.py)
+# Set to empty string or null to disable motion trajectory observations
+motion_npz_path: "/home/blake/gen_mimic/artifacts/throw_neutral_2:v0/motion.npz"
 
 # stand_policy_path: "{G1_RL_ROOT_DIR}/deploy/ckpts/policy_0.85_extended.pt"
 # xml_path: "/home/yangl/BeyondMimic/g1_ctrl/unitree_robots/g1/scene_29dof_rl.xml"
@@ -14,17 +18,6 @@ robot_xml_path: "/home/blake/gen_mimic/g1/g1_29dof_rl.xml"
 # robot_xml_path: "/home/yangl/BeyondMimic/g1_ctrl/unitree_robots/g1/g1_29dof_rl.xml"
 # urdf_path: "/home/yangl/BeyondMimic/whole_body_tracking/source/whole_body_tracking/whole_body_tracking/assets/unitree_description/urdf/g1/main.urdf"
 urdf_path: "/home/blake/gen_mimic/source/whole_body_tracking/whole_body_tracking/assets/unitree_description/urdf/g1/main.urdf"
-
-use_height_map: False
-height_map_topic: "/heightmap_cells"
-grid_size_x: 1.0
-grid_size_y: 1.0
-resolution: 0.1
-grid_points_x: 11
-grid_points_y: 11
-N_grid_points: 121
-forward_offset: 0.0
-height_offset: 0.5
 
 # Total simulation time
 simulation_duration: 50.0
