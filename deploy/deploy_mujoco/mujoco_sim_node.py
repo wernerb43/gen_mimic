@@ -12,7 +12,7 @@ import numpy as np
 import rclpy
 import yaml
 from rclpy.node import Node
-from scipy.spatial.transform import Rotation as R
+# from scipy.spatial.transform import Rotation as R
 from std_msgs.msg import Float32MultiArray, Float64
 
 
@@ -34,6 +34,9 @@ class MujocoSimNode(Node):
             Float32MultiArray, "ankle_heights", 10
         )
         self.height_map_pub = self.create_publisher(Float32MultiArray, "height_map", 10)
+        self.base_lin_vel_pub = self.create_publisher(
+            Float32MultiArray, "base_lin_vel", 10
+        )
         # Publisher to signal RL policy to enable control (Float64: 0.0/1.0)
         self.control_enable_pub = self.create_publisher(Float64, "control_enable", 10)
         self.action_sub = self.create_subscription(
@@ -74,7 +77,6 @@ class MujocoSimNode(Node):
         #     "{G1_RL_ROOT_DIR}", G1_RL_ROOT_DIR
         # )
         self.xml_path = config["xml_path"].replace("{G1_RL_ROOT_DIR}", G1_RL_ROOT_DIR)
-        self.use_height_map = config["use_height_map"]
 
         self.grid_size_x = float(config["grid_size_x"])
         self.grid_size_y = float(config["grid_size_y"])
@@ -118,19 +120,6 @@ class MujocoSimNode(Node):
         self.viewer_sync_interval = 1.0 / 30.0  # 30Hz
         self._last_viewer_sync_time = 0.0
 
-        # Initialize height map visualization if enabled
-        if self.use_height_map:
-            # Initialize visualization spheres for height map points
-            for i in range(self.N_grid_points):
-                mujoco.mjv_initGeom(
-                    self.viewer.user_scn.geoms[i],
-                    type=mujoco.mjtGeom.mjGEOM_SPHERE,
-                    size=np.array([0.02, 0, 0]),
-                    pos=np.array([0, 0, 0]),
-                    mat=np.eye(3).flatten(),
-                    rgba=np.array([1, 0, 0, 1]),
-                )
-                self.viewer.user_scn.ngeom += 1
 
     def action_callback(self, msg):
         # Expect msg.data to be [position, p, d] repeated for each joint
@@ -173,88 +162,6 @@ class MujocoSimNode(Node):
         left_height = self.d.xpos[self.left_foot_id][2]  # Z coordinate
         right_height = self.d.xpos[self.right_foot_id][2]  # Z coordinate
         return left_height, right_height
-
-    def get_height_map(self):
-        """Generate a height map around the robot's base"""
-
-        hit_points = np.zeros((self.N_grid_points, 3), dtype=np.float32)
-        self.hit_points_viz = np.zeros((self.N_grid_points, 3), dtype=np.float32)
-
-        base_pos = self.d.qpos[:3].copy()
-        base_quat = self.d.qpos[3:7].copy()
-
-        # Height map needs to be in the yaw frame
-        # Get the yaw of the quat
-        r = R.from_quat([base_quat[1], base_quat[2], base_quat[3], base_quat[0]])
-        base_yaw = r.as_euler("zyx", degrees=False)[0]
-
-        # 2D rotation matrix for the yaw
-        cos_yaw = np.cos(base_yaw)
-        sin_yaw = np.sin(base_yaw)
-        R_2d = np.array([[cos_yaw, -sin_yaw], [sin_yaw, cos_yaw]])
-
-        # Starting position for the grid (offset forward by 0.2m and centered)
-        offset = np.array(
-            [-self.forward_offset + self.grid_size_x / 2, self.grid_size_y / 2]
-        )
-        grid_start = base_pos[:2] - R_2d @ offset
-
-        # Cast rays from each point in the grid
-        point_index = 0
-        for i in range(self.grid_points_y):  # Note that we are going in row-major order
-            for j in range(self.grid_points_x):
-                # Calculate the x, y coordinates for this grid point
-                # The IsaacLab grid config defaults to "xy" which means the inner loop is x
-                offset = np.array([(j * self.resolution), (i * self.resolution)])
-                xy = grid_start + R_2d @ offset
-
-                # Ray parameters
-                ray_origin = np.array([xy[0], xy[1], base_pos[2]])
-                ray_direction = np.array([0.0, 0.0, -1.0])
-                geomid = np.zeros(1, dtype=np.int32)
-                geom_group = np.zeros(6, dtype=np.int32)
-                geom_group[2] = 1  # Only include group 2
-
-                # Cast the ray
-                distance = mujoco.mj_ray(
-                    self.m,
-                    self.d,
-                    ray_origin.astype(np.float64),
-                    ray_direction.astype(np.float64),
-                    geom_group,
-                    1,  # flg_static
-                    -1,  # bodyid
-                    geomid,
-                )
-
-                if distance != -1.0:
-                    hit_points[point_index, :] = np.array(
-                        [xy[0], xy[1], -distance + base_pos[2]]
-                    )  # Location in world frame
-                    self.hit_points_viz[point_index, :] = np.array(
-                        [xy[0], xy[1], -distance + base_pos[2]]
-                    )  # Store for visualization
-
-                    # Print info for the center point (used for ground height)
-                    # if i == grid_points_y // 2 and j == grid_points_x // 2:
-                    #     ground_height = -distance + base_pos[2]
-                    #     print("Ground height: ", ground_height)
-                    #     if geomid[0] != -1:
-                    #         geom_name = mujoco.mj_id2name(self.m, mujoco.mjtObj.mjOBJ_GEOM, geomid[0])
-                    #         print("Hit object name: ", geom_name)
-                else:
-                    # If no hit, use a default position at ground level
-                    self.hit_points_viz[point_index, :] = np.array([xy[0], xy[1], 0.0])
-                # else:
-                #     # If no hit, set to center
-                #     hit_points[point_index, :] = hit_points[18, :]
-
-                point_index += 1
-
-        ground_heights = hit_points[:, 2]
-        ground_heights = ground_heights.reshape((self.N_grid_points,))
-
-        return ground_heights
 
     def sim_step(self):
         self.viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
@@ -359,30 +266,11 @@ class MujocoSimNode(Node):
         ankle_heights_msg.data = [left_height, right_height]
         self.ankle_heights_pub.publish(ankle_heights_msg)
 
-        if self.use_height_map:
-            ground_heights = self.get_height_map()
-            base_pos = self.d.qpos[:3].copy()
-            self.height_obs = base_pos[2] - ground_heights - self.height_offset
-            self.height_obs = np.ones_like(self.height_obs) * 0.23
-            # self.height_obs = torch.ones_like(self.height_obs) * -1.21
-            # Normalize height map points: subtract mean, divide by stddev
-            # mean = np.mean(self.height_obs)
-            # std = np.std(self.height_obs) if np.std(self.height_obs) > 1e-5 else 1.0
-            # print(std)
-            # std = np.max(np.std(self.height_obs), 1e-7)
-            # self.height_obs = (self.height_obs - mean) / std
-            # self.height_obs = np.zeros_like(self.height_obs)
-            # print("Height map points (normalized): ", self.height_obs)
-
-            msg = Float32MultiArray()
-            msg.data = self.height_obs.tolist()
-            self.height_map_pub.publish(msg)
-
-            # Update visualization spheres
-            for i in range(self.N_grid_points):
-                if hasattr(self, "hit_points_viz"):
-                    self.viewer.user_scn.geoms[i].pos = self.hit_points_viz[i, :]
-        # Track joint error statistics (RL policy node performs plotting)
+        # Publish base linear velocity (from first 3 elements of qvel)
+        base_lin_vel = self.d.qvel[0:3]
+        base_lin_vel_msg = Float32MultiArray()
+        base_lin_vel_msg.data = base_lin_vel.tolist()
+        self.base_lin_vel_pub.publish(base_lin_vel_msg)
 
         # --- Synchronize simulation time with real time ---
         sim_dt = self.simulation_dt

@@ -3,6 +3,7 @@
 import argparse
 import os
 import subprocess
+import sys
 
 import yaml
 
@@ -24,8 +25,9 @@ def main():
     args = parser.parse_args()
 
     # Set environment variable if not already set
-    if "G1_RL_ROOT_DIR" not in os.environ:
-        os.environ["G1_RL_ROOT_DIR"] = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    os.environ["G1_RL_ROOT_DIR"] = "/home/blake/gen_mimic"
+    # if "G1_RL_ROOT_DIR" not in os.environ:
+    #     os.environ["G1_RL_ROOT_DIR"] = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     G1_RL_ROOT_DIR = os.getenv("G1_RL_ROOT_DIR")
     # read the config
     config_file = args.config
@@ -34,19 +36,19 @@ def main():
     plot_feet = config.get("plot_feet", False)
 
     sim_cmd = [
-        "python",
+        sys.executable,
         os.path.join(os.path.dirname(__file__), "mujoco_sim_node.py"),
         "--config",
         args.config,
     ]
     policy_cmd_29 = [
-        "python",
+        sys.executable,
         os.path.join(os.path.dirname(__file__), "rl_policy_node.py"),
         "--config",
         args.config,
     ]
     policy_cmd_13 = [
-        "python",
+        sys.executable,
         os.path.join(os.path.dirname(__file__), "rl_policy_node_13dof.py"),
         "--config",
         args.config,
@@ -59,7 +61,7 @@ def main():
         raise ValueError("Invalid DOF value. Must be 13 or 29.")
     if plot_feet:
         plotter_cmd = [
-            "python",
+            sys.executable,
             os.path.join(os.path.dirname(__file__), "foot_force_plotter.py"),
         ]
 

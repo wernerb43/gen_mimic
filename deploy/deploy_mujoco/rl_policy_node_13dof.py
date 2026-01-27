@@ -8,10 +8,6 @@ import rclpy
 import yaml
 import sys
 import math
-import termios
-import tty
-import select
-import os
 
 try:
     import matplotlib
@@ -37,24 +33,7 @@ except Exception:
 from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray, Float64
 
-try:
-    from inputs import get_gamepad
-except ImportError:
-    get_gamepad = None
-    print("inputs library not found. Xbox controller input will not work.")
-
 import xml.etree.ElementTree as ET
-
-# --- ADDED: attempt to import G1 analytical IK solver (non-fatal) ---
-try:
-    # adjust path to where your build installs the python module
-    sys.path.append("/home/yangl/BeyondMimic/g1_ctrl/analytical_kinematic_solver/build")
-    import g1_kinematics  # type: ignore
-
-    G1_KINEMATICS_AVAILABLE = True
-except Exception:
-    g1_kinematics = None
-    G1_KINEMATICS_AVAILABLE = False
 
 # add typing imports for explicit annotation to avoid List[None] inference
 from typing import List, Optional, Tuple
@@ -99,19 +78,6 @@ class RLPolicyNode(Node):
             self.cmd = np.concatenate([self.cmd_init.copy(), np.array([0.75], dtype=np.float32)])
         else:
             self.cmd = self.cmd_init.copy()
-
-        # joystick input thread if available
-        if get_gamepad is not None:
-            self.joystick_thread = threading.Thread(
-                target=self.joystick_loop, daemon=True
-            )
-            self.joystick_thread.start()
-
-        # Keyboard input thread
-        self.keyboard_thread = threading.Thread(
-            target=self.keyboard_loop, daemon=True
-        )
-        self.keyboard_thread.start()
 
         # Lightweight state used by simplified node
         self.height_map = np.full(
@@ -163,69 +129,6 @@ class RLPolicyNode(Node):
                 )
                 self.plot_enabled = False
 
-        # --- ADDED: IK solver availability and simple defaults ---
-        # Prefer robot_xml_path as the MuJoCo model used by the IK solver if available
-        self.ik_model_path = getattr(self, "robot_xml_path", None)
-        self.ik_enabled = G1_KINEMATICS_AVAILABLE and (
-            self.ik_model_path is not None and os.path.isfile(self.ik_model_path)
-        )
-        if self.ik_enabled:
-            self.get_logger().info(
-                f"G1 analytical kinematics available, model: {self.ik_model_path}"
-            )
-        else:
-            # keep node alive even if IK not installed
-            if not G1_KINEMATICS_AVAILABLE:
-                self.get_logger().warning(
-                    "G1 kinematics module not available; IK fallbacks disabled."
-                )
-            else:
-                self.get_logger().warning(
-                    "IK model path not found; IK fallbacks disabled."
-                )
-
-        # IK candidate placeholders (ONNX/Isaac order)
-        # These will be filled each control step (policy_step) and are used by obs_ik_* functions.
-        self.ik_traj = None  # ndarray shape (T, num_joints) in ONNX order or None
-        self.ik_joint_pos = (
-            self.isaac_to_mujoco(self.default_joint_pos)
-            if hasattr(self, "default_joint_pos")
-            else np.zeros(getattr(self, "num_joints", 29), dtype=np.float32)
-        )
-
-        # IK cache (pre-generated grid) variables
-        # explicit typing: entries are Optional[ (pos_traj, vel_traj) ]
-        self.ik_cache: List[
-            Optional[
-                Tuple[
-                    np.ndarray,
-                    np.ndarray,
-                ]
-            ]
-        ] = []  # list of (pos_traj, vel_traj) or None
-        self.velocity_grid = None  # numpy array shape (G,2) for (vx, vy)
-        self.velocity_to_index = {}  # map (vx,vy) -> index in ik_cache
-        self.velocity_granularity = 0.05  # resolution for cache grid
-        self.lin_vel_x_range = (-self.max_cmd[0], self.max_cmd[0])
-        self.lin_vel_y_range = (-self.max_cmd[1], self.max_cmd[1])
-
-        # --- NEW: IK cache file path ---
-        self.ik_cache_path = os.path.join(
-            os.path.dirname(self.robot_xml_path),
-            f"ik_cache_{self.velocity_granularity:.2f}.npz"
-        ) if self.ik_enabled else None
-
-        # Pre-generate or load the IK cache if IK available
-        if self.ik_enabled:
-            try:
-                loaded = self._load_ik_cache()
-                # loaded = False  # TODO change back when done
-                if not loaded:
-                    self._pre_generate_ik_cache()
-                    self._save_ik_cache()
-            except Exception as e:
-                self.get_logger().warning(f"IK cache load/generation failed: {e}")
-                # leave cache empty and continue
 
     def load_config(self):
         G1_RL_ROOT_DIR = os.getenv("G1_RL_ROOT_DIR")

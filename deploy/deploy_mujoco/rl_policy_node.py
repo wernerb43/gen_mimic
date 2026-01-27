@@ -8,21 +8,18 @@ import rclpy
 import yaml
 import sys
 import math
-import termios
-import tty
-import select
 import os
 
-try:
-    import matplotlib
+# try:
+#     import matplotlib
 
-    if not os.environ.get("DISPLAY") and os.name != "nt":
-        matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+#     if not os.environ.get("DISPLAY") and os.name != "nt":
+#         matplotlib.use("Agg")
+#     import matplotlib.pyplot as plt
 
-    MATPLOTLIB_AVAILABLE = True
-except Exception:
-    MATPLOTLIB_AVAILABLE = False
+#     MATPLOTLIB_AVAILABLE = True
+# except Exception:
+#     MATPLOTLIB_AVAILABLE = False
 
 # use python onnx package only (no onnxruntime)
 import onnx
@@ -37,24 +34,7 @@ except Exception:
 from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray, Float64
 
-try:
-    from inputs import get_gamepad
-except ImportError:
-    get_gamepad = None
-    print("inputs library not found. Xbox controller input will not work.")
-
 import xml.etree.ElementTree as ET
-
-# --- ADDED: attempt to import G1 analytical IK solver (non-fatal) ---
-try:
-    # adjust path to where your build installs the python module
-    sys.path.append("/home/yangl/BeyondMimic/g1_ctrl/analytical_kinematic_solver/build")
-    import g1_kinematics  # type: ignore
-
-    G1_KINEMATICS_AVAILABLE = True
-except Exception:
-    g1_kinematics = None
-    G1_KINEMATICS_AVAILABLE = False
 
 # add typing imports for explicit annotation to avoid List[None] inference
 from typing import List, Optional, Tuple
@@ -80,6 +60,9 @@ class RLPolicyNode(Node):
         self.heightmap_sub = self.create_subscription(
             Float32MultiArray, "height_map", self.heightmap_callback, 10
         )
+        self.base_lin_vel_sub = self.create_subscription(
+            Float32MultiArray, "base_lin_vel", self.base_lin_vel_callback, 10
+        )
         self.action_pub = self.create_publisher(Float32MultiArray, "action", 10)
         self.sim_time = 0.0
 
@@ -94,30 +77,17 @@ class RLPolicyNode(Node):
 
         self.cmd_lock = threading.Lock()
         # Initialize command from config (vx, vy, vyaw, height)
-        # If cmd_init has 3 elements, add height=0.75 as 4th element
         if len(self.cmd_init) == 3:
             self.cmd = np.concatenate([self.cmd_init.copy(), np.array([0.75], dtype=np.float32)])
         else:
             self.cmd = self.cmd_init.copy()
-
-        # joystick input thread if available
-        if get_gamepad is not None:
-            self.joystick_thread = threading.Thread(
-                target=self.joystick_loop, daemon=True
-            )
-            self.joystick_thread.start()
-
-        # Keyboard input thread
-        self.keyboard_thread = threading.Thread(
-            target=self.keyboard_loop, daemon=True
-        )
-        self.keyboard_thread.start()
 
         # Lightweight state used by simplified node
         self.height_map = np.full(
             (self.N_grid_points,), float(self.height_offset), dtype=np.float32
         )
         self.robot_position = np.zeros(3, dtype=np.float32)
+        self.base_lin_vel = np.zeros(3, dtype=np.float32)
         self.qj = np.zeros(29, dtype=np.float32)
         self.dqj = np.zeros(29, dtype=np.float32)
         self.omega = np.zeros(3, dtype=np.float32)
@@ -139,92 +109,29 @@ class RLPolicyNode(Node):
         self.plot_act_joint0_hist: List[float] = []
         self.plot_cmd_vel0_hist: List[float] = []
         self.plot_act_vel0_hist: List[float] = []
-        if MATPLOTLIB_AVAILABLE:
-            try:
-                plt.ion()
-                self.fig, (self.ax_pos, self.ax_vel) = plt.subplots(
-                    2, 1, sharex=True, figsize=(8, 6)
-                )
-                self.pos_cmd_line, = self.ax_pos.plot([], [], label="cmd joint0")
-                self.pos_act_line, = self.ax_pos.plot([], [], label="act joint0")
-                self.ax_pos.set_ylabel("Joint0 pos (rad)")
-                self.ax_pos.legend(loc="upper right")
-                self.vel_cmd_line, = self.ax_vel.plot([], [], label="cmd vel0")
-                self.vel_act_line, = self.ax_vel.plot([], [], label="act vel0")
-                self.ax_vel.set_ylabel("Joint0 vel (rad/s)")
-                self.ax_vel.set_xlabel("Time (s)")
-                self.ax_vel.legend(loc="upper right")
-                self.plot_enabled = True
-            except Exception as exc:
-                print(
-                    f"[RLPolicyNode] Failed to initialize command plot: {exc}",
-                    flush=True,
-                )
-                self.plot_enabled = False
+        # if MATPLOTLIB_AVAILABLE:
+        #     try:
+        #         plt.ion()
+        #         self.fig, (self.ax_pos, self.ax_vel) = plt.subplots(
+        #             2, 1, sharex=True, figsize=(8, 6)
+        #         )
+        #         self.pos_cmd_line, = self.ax_pos.plot([], [], label="cmd joint0")
+        #         self.pos_act_line, = self.ax_pos.plot([], [], label="act joint0")
+        #         self.ax_pos.set_ylabel("Joint0 pos (rad)")
+        #         self.ax_pos.legend(loc="upper right")
+        #         self.vel_cmd_line, = self.ax_vel.plot([], [], label="cmd vel0")
+        #         self.vel_act_line, = self.ax_vel.plot([], [], label="act vel0")
+        #         self.ax_vel.set_ylabel("Joint0 vel (rad/s)")
+        #         self.ax_vel.set_xlabel("Time (s)")
+        #         self.ax_vel.legend(loc="upper right")
+        #         self.plot_enabled = True
+        #     except Exception as exc:
+        #         print(
+        #             f"[RLPolicyNode] Failed to initialize command plot: {exc}",
+        #             flush=True,
+        #         )
+        #         self.plot_enabled = False
 
-        # --- ADDED: IK solver availability and simple defaults ---
-        # Prefer robot_xml_path as the MuJoCo model used by the IK solver if available
-        self.ik_model_path = getattr(self, "robot_xml_path", None)
-        self.ik_enabled = G1_KINEMATICS_AVAILABLE and (
-            self.ik_model_path is not None and os.path.isfile(self.ik_model_path)
-        )
-        if self.ik_enabled:
-            self.get_logger().info(
-                f"G1 analytical kinematics available, model: {self.ik_model_path}"
-            )
-        else:
-            # keep node alive even if IK not installed
-            if not G1_KINEMATICS_AVAILABLE:
-                self.get_logger().warning(
-                    "G1 kinematics module not available; IK fallbacks disabled."
-                )
-            else:
-                self.get_logger().warning(
-                    "IK model path not found; IK fallbacks disabled."
-                )
-
-        # IK candidate placeholders (ONNX/Isaac order)
-        # These will be filled each control step (policy_step) and are used by obs_ik_* functions.
-        self.ik_traj = None  # ndarray shape (T, num_joints) in ONNX order or None
-        self.ik_joint_pos = (
-            self.isaac_to_mujoco(self.default_joint_pos)
-            if hasattr(self, "default_joint_pos")
-            else np.zeros(getattr(self, "num_joints", 29), dtype=np.float32)
-        )
-
-        # IK cache (pre-generated grid) variables
-        # explicit typing: entries are Optional[ (pos_traj, vel_traj) ]
-        self.ik_cache: List[
-            Optional[
-                Tuple[
-                    np.ndarray,
-                    np.ndarray,
-                ]
-            ]
-        ] = []  # list of (pos_traj, vel_traj) or None
-        self.velocity_grid = None  # numpy array shape (G,2) for (vx, vy)
-        self.velocity_to_index = {}  # map (vx,vy) -> index in ik_cache
-        self.velocity_granularity = 0.05  # resolution for cache grid
-        self.lin_vel_x_range = (-self.max_cmd[0], self.max_cmd[0])
-        self.lin_vel_y_range = (-self.max_cmd[1], self.max_cmd[1])
-
-        # --- NEW: IK cache file path ---
-        self.ik_cache_path = os.path.join(
-            os.path.dirname(self.robot_xml_path),
-            f"ik_cache_{self.velocity_granularity:.2f}.npz"
-        ) if self.ik_enabled else None
-
-        # Pre-generate or load the IK cache if IK available
-        if self.ik_enabled:
-            try:
-                loaded = self._load_ik_cache()
-                # loaded = False  # TODO change back when done
-                if not loaded:
-                    self._pre_generate_ik_cache()
-                    self._save_ik_cache()
-            except Exception as e:
-                self.get_logger().warning(f"IK cache load/generation failed: {e}")
-                # leave cache empty and continue
 
     def load_config(self):
         G1_RL_ROOT_DIR = os.getenv("G1_RL_ROOT_DIR")
@@ -499,59 +406,6 @@ class RLPolicyNode(Node):
                 f"Failed to load or validate ONNX model at '{self.policy_path}': {e}"
             )
 
-    def _save_ik_cache(self):
-        """Save IK cache, velocity grid, and velocity_to_index to disk."""
-        if self.ik_cache_path is None:
-            return
-        try:
-            # Save as npz: ik_cache (object array), velocity_grid, velocity_to_index (as keys/indices)
-            ik_cache_arr = np.array(self.ik_cache, dtype=object)
-            np.savez(
-                self.ik_cache_path,
-                ik_cache=ik_cache_arr,
-                velocity_grid=self.velocity_grid,
-                velocity_to_index_keys=np.array(list(self.velocity_to_index.keys())),
-                velocity_to_index_vals=np.array(list(self.velocity_to_index.values())),
-            )
-            print(f"\nIK cache saved to {self.ik_cache_path}")
-        except Exception as e:
-            print(f"\nFailed to save IK cache: {e}")
-
-    def _load_ik_cache(self):
-        """Try to load IK cache from disk. Returns True if loaded, False otherwise."""
-        if self.ik_cache_path is None or not os.path.isfile(self.ik_cache_path):
-            return False
-        try:
-            print(f"Loading IK cache from {self.ik_cache_path}")
-            data = np.load(self.ik_cache_path, allow_pickle=True)
-            raw_cache = list(data["ik_cache"])
-            coerced_cache = []
-            for entry in raw_cache:
-                pos = vel = None
-                if isinstance(entry, (list, tuple)) and len(entry) == 2:
-                    pos, vel = entry
-                elif isinstance(entry, np.ndarray) and entry.dtype == object and entry.size == 2:
-                    pos, vel = entry[0], entry[1]
-                else:
-                    raise ValueError(
-                        "IK cache entries must be (position, velocity) pairs."
-                    )
-                pos_arr = np.asarray(pos, dtype=np.float32)
-                vel_arr = np.asarray(vel, dtype=np.float32)
-                if pos_arr.shape != vel_arr.shape:
-                    raise ValueError(
-                        "IK cache entry has mismatched position and velocity shapes."
-                    )
-                coerced_cache.append((pos_arr, vel_arr))
-            self.ik_cache = coerced_cache
-            self.velocity_grid = data["velocity_grid"].astype(np.float32, copy=False)
-            keys = data["velocity_to_index_keys"]
-            vals = data["velocity_to_index_vals"]
-            self.velocity_to_index = {tuple(map(float, k)): int(v) for k, v in zip(keys, vals)}
-            return True
-        except Exception as e:
-            raise RuntimeError(f"Failed to load IK cache: {e}") from e
-
     def _compute_traj_velocities(self, pos_traj, dt):
         """
         Compute per-frame joint velocities for a position trajectory pos_traj (T, num_joints).
@@ -570,62 +424,6 @@ class RLPolicyNode(Node):
         vel[1:, :] = (pos[1:, :] - pos[:-1, :]) / dt_val
         vel[0, :] = vel[1, :] if T > 1 else 0.0
         return vel.astype(np.float32)
-
-    def _pre_generate_ik_cache(self):
-        """Pre-generate IK trajectories for a grid of (vx, vy) and store ONNX-ordered trajectories and velocities."""
-        # build grid
-        vx_min, vx_max = self.lin_vel_x_range
-        vy_min, vy_max = self.lin_vel_y_range
-        step = self.velocity_granularity
-        vx_samples = np.arange(vx_min, vx_max + 1e-8, step, dtype=np.float32)
-        vy_samples = np.arange(vy_min, vy_max + 1e-8, step, dtype=np.float32)
-        combos = []
-        for vx in vx_samples:
-            for vy in vy_samples:
-                key = (round(float(vx), 3), round(float(vy), 3))
-                combos.append(key)
-        G = len(combos)
-        self.velocity_grid = np.array([[c[0], c[1]] for c in combos], dtype=np.float32)
-        self.velocity_to_index = {combos[i]: i for i in range(G)}
-        # Now each entry will be (pos_traj, vel_traj)
-        self.ik_cache = [None] * G
-
-        # --- Progress bar setup ---
-        print(f"Generating IK cache for {G} velocity combinations...")
-        bar_width = 40
-        last_percent = -1
-
-        # Generate trajectories (store entire traj in ONNX order and precompute velocities)
-        for i, (vx, vy) in enumerate(combos):
-            try:
-                traj_data = self.solve_ik_velocity(vx, vy, 0.0, step_period=0.5)
-                if traj_data is None:
-                    # fallback: single-frame default joints
-                    T = 1
-                    pos = np.tile(self.default_joint_pos.astype(np.float32), (T, 1))
-                else:
-                    joint_traj = traj_data
-                    pos = joint_traj.astype(np.float32)  # (T, num_joints) in ONNX order
-
-                # compute per-frame velocities using helper
-                dt = float(getattr(self, "control_dt", 0.02))
-                vel = self._compute_traj_velocities(pos, dt)
-
-                # store tuple (pos_traj, vel_traj)
-                self.ik_cache[i] = (pos, vel)
-            except Exception:
-                T = 1
-                pos = np.tile(self.default_joint_pos.astype(np.float32), (T, 1))
-                vel = np.zeros_like(pos, dtype=np.float32)
-                self.ik_cache[i] = (pos, vel)
-            # --- Progress bar update ---
-            percent = int((i + 1) * 100 / G)
-            if percent != last_percent:
-                filled = int(bar_width * percent / 100)
-                bar = "[" + "#" * filled + "-" * (bar_width - filled) + "]"
-                print(f"\r{bar} {percent}% ({i+1}/{G})", end="", flush=True)
-                last_percent = percent
-        print("\nIK cache generation complete.")
 
     def _find_closest_cached_velocity(self, vel_x: float, vel_y: float = 0.0):
         """Return the cached velocity key nearest to (vel_x, vel_y)."""
@@ -721,100 +519,6 @@ class RLPolicyNode(Node):
         # Return first output ndarray
         return outputs[0]
 
-    # --- NEW: helper that calls G1 IK and returns joint trajectory in ONNX order ---
-    def solve_ik_velocity(
-        self,
-        vel_x: float,
-        vel_y: float = 0.0,
-        vel_yaw: float = 0.0,
-        step_period: float = 0.5,
-    ):
-        """
-        Use g1_kinematics.solve_kinematics_multi_step to compute a trajectory
-        for the requested velocity. Returns joint position trajectory in ONNX/Isaac order:
-            traj_onnx: ndarray shape (T, num_joints)
-        If IK is unavailable or fails, returns None.
-        """
-        if not self.ik_enabled:
-            return None
-        try:
-            # Build SolverInput similar to commands_ik_cached
-            solver_input = g1_kinematics.SolverInput()
-            # target step length based on velocity * step_period
-            solver_input.target_step_length = [
-                float(vel_x * step_period),
-                float(vel_y * step_period),
-                0.0,
-            ]
-            is_stationary = math.hypot(float(vel_x), float(vel_y)) < 0.01
-            solver_input.target_step_height = 0.0 if is_stationary else 0.15
-            # default base and joint pose approximations (use metadata default_joint_pos if present)
-            base_pos_global = [0.0, 0.0, float(getattr(self, "pelvis_height", 0.75))]
-            base_quat = [1.0, 0.0, 0.0, 0.0]
-            if hasattr(self, "default_joint_pos"):
-                joint0 = (
-                    list(self.default_joint_pos.tolist())
-                    if isinstance(self.default_joint_pos, np.ndarray)
-                    else list(self.default_joint_pos)
-                )
-            else:
-                joint0 = [0.0] * getattr(self, "num_joints", 29)
-            solver_input.base0_pos = base_pos_global
-            solver_input.base0_quat = base_quat
-            solver_input.joint0_pos = self.isaac_to_mujoco(joint0)
-            solver_input.dt = float(getattr(self, "control_dt", 0.02))
-            standing_T = 300
-            solver_input.T = standing_T if is_stationary else int(step_period / solver_input.dt)
-            solver_input.foot = 2 if vel_y >= 0.0 else 3  # left or right foot swing first
-            foot_width = 0.2
-            # anchor/swing foot positions relative to base
-            if vel_y >= 0.0:
-                anchor = [
-                    base_pos_global[0],
-                    base_pos_global[1] - foot_width / 2.0,
-                    0.0,
-                ]
-                swing = [base_pos_global[0], base_pos_global[1] + foot_width / 2.0, 0.0]
-            else:
-                anchor = [
-                    base_pos_global[0],
-                    base_pos_global[1] + foot_width / 2.0,
-                    0.0,
-                ]
-                swing = [base_pos_global[0], base_pos_global[1] - foot_width / 2.0, 0.0]
-            solver_input.anchor_foot_wpos = anchor
-            solver_input.swing_foot_wpos = swing
-
-            # Call IK solver
-            traj = g1_kinematics.solve_kinematics_multi_step(
-                "/home/yangl/BeyondMimic/g1_ctrl/unitree_robots/g1/scene_29dof.xml", solver_input, solver_input.dt * solver_input.T
-            )
-            trajectory_np = traj.as_numpy().T.astype(np.float32)  # shape (36, T)
-
-            # Extract joint portion (MuJoCo/XML order rows 7:36)
-            if trajectory_np.shape[0] >= 36:
-                mujoco_joints = trajectory_np[7:36, :]  # (29, T)
-            else:
-                # handle shorter outputs robustly
-                n_j = getattr(
-                    self,
-                    "num_joints",
-                    mujoco_joints.shape[0] if "mujoco_joints" in locals() else 29,
-                )
-                mujoco_joints = np.zeros(
-                    (n_j, trajectory_np.shape[1]), dtype=np.float32
-                )
-
-            # convert to ONNX/Isaac order per time-step using existing mapping helpers
-            T = mujoco_joints.shape[1]
-            traj_onnx = np.zeros((T, len(self.joint_names)), dtype=np.float32)
-            for t in range(T):
-                # mujoco_to_isaac expects array in XML order -> returns ONNX order
-                traj_onnx[t, :] = self.mujoco_to_isaac(mujoco_joints[:, t])
-            return traj_onnx
-        except Exception as e:
-            self.get_logger().warning(f"IK solver failed: {e}")
-            return None
 
     def policy_step(self):
         """
@@ -866,107 +570,6 @@ class RLPolicyNode(Node):
                 )
                 exit(0)
 
-    def joystick_loop(self):
-        # Xbox controller axes: left stick (ABS_X, ABS_Y), right stick (ABS_RX)
-        # Typical value range: -32768 to 32767
-        vx, vy, vyaw = 0.0, 0.0, 0.0
-        while True:
-            try:
-                events = get_gamepad()
-                for event in events:
-                    if event.ev_type == "Absolute":
-                        if event.code == "ABS_X":  # Left stick horizontal
-                            vy = -event.state / 32768.0  # normalize to [-1, 1]
-                        elif event.code == "ABS_Y":  # Left stick vertical
-                            vx = -event.state / 32768.0  # invert so up is positive
-                        elif event.code == "ABS_RX":  # Right stick horizontal
-                            vyaw = event.state / 32768.0
-                        # D-pad up/down for height control (ABS_HAT0Y: -1=up, 1=down, 0=neutral)
-                        elif event.code == "ABS_HAT0Y":
-                            with self.cmd_lock:
-                                if event.state == -1:  # D-pad up
-                                    self.cmd[3] = min(0.75, self.cmd[3] + 0.01)
-                                elif event.state == 1:  # D-pad down
-                                    self.cmd[3] = max(0.4, self.cmd[3] - 0.01)
-                with self.cmd_lock:
-                    self.cmd[0] = vx * self.cmd_scale[0] * self.max_cmd[0]
-                    self.cmd[1] = vy * self.cmd_scale[1] * self.max_cmd[1]
-                    self.cmd[2] = -vyaw * self.cmd_scale[2] * self.max_cmd[2]
-                    # cmd[3] (height) is only modified by D-pad, keep existing value
-            except Exception:
-                # Avoid crashing the thread
-                pass
-
-    def keyboard_loop(self):
-        """
-        Reads keyboard input from stdin (non-blocking) and updates commands.
-        WASD: Linear Velocity (X/Y)
-        Arrow Keys: Height (Up/Down) and Yaw (Left/Right)
-        """
-        def get_key():
-            fd = sys.stdin.fileno()
-            old_settings = termios.tcgetattr(fd)
-            try:
-                # Use setcbreak to preserve signals (Ctrl+C) and output formatting
-                tty.setcbreak(fd)
-                rlist, _, _ = select.select([fd], [], [], 0.1)
-                if rlist:
-                    key = os.read(fd, 1)
-                    if key == b'\x1b':  # Escape sequence for arrows
-                        # Check if there are more characters for escape sequence
-                        rlist2, _, _ = select.select([fd], [], [], 0.05)
-                        if rlist2:
-                            key += os.read(fd, 2)
-                    return key.decode('utf-8', errors='ignore')
-                return None
-            except KeyboardInterrupt:
-                return None
-            except Exception as e:
-                print(f"Error reading key: {e}", flush=True)
-                return None
-            finally:
-                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-
-        print("[RLPolicyNode] Keyboard control enabled: WASD for move, Arrows for Height/Yaw", flush=True)
-        
-        # Internal state for smooth control
-        target_vx, target_vy, target_vyaw = 0.0, 0.0, 0.0
-        
-        while True:
-            try:
-                key = get_key()
-                if key:
-                    with self.cmd_lock:
-                        # WASD for Linear Velocity
-                        if key == 'w':
-                            self.cmd[0] = min(self.max_cmd[0], self.cmd[0] + 0.05)
-                        elif key == 's':
-                            self.cmd[0] = max(-self.max_cmd[0], self.cmd[0] - 0.05)
-                        elif key == 'a':
-                            self.cmd[1] = min(self.max_cmd[1], self.cmd[1] + 0.05)
-                        elif key == 'd':
-                            self.cmd[1] = max(-self.max_cmd[1], self.cmd[1] - 0.05)
-                        
-                        # Arrow Keys for Height and Yaw
-                        elif key == '\x1b[A':  # Up Arrow
-                            self.cmd[3] = min(0.75, self.cmd[3] + 0.01)
-                        elif key == '\x1b[B':  # Down Arrow
-                            self.cmd[3] = max(0.4, self.cmd[3] - 0.01)
-                        elif key == '\x1b[D':  # Left Arrow
-                            self.cmd[2] = min(self.max_cmd[2], self.cmd[2] + 0.05)
-                        elif key == '\x1b[C':  # Right Arrow
-                            self.cmd[2] = max(-self.max_cmd[2], self.cmd[2] - 0.05)
-                        
-                        # Space to stop
-                        elif key == ' ':
-                            self.cmd[0] = 0.0
-                            self.cmd[1] = 0.0
-                            self.cmd[2] = 0.0
-                            
-                        # print(f"Cmd: vx={self.cmd[0]:.2f}, vy={self.cmd[1]:.2f}, yaw={self.cmd[2]:.2f}, h={self.cmd[3]:.2f}", flush=True)
-
-            except Exception as e:
-                print(f"Keyboard input error: {e}", flush=True)
 
     def pd_control(self, target_q, q, kp, target_dq, dq, kd):
         """Calculates torques from position commands"""
@@ -1003,6 +606,11 @@ class RLPolicyNode(Node):
         received = np.array(msg.data, dtype=np.float32)
         self.height_map[: received.shape[0]] = received
 
+    def base_lin_vel_callback(self, msg):
+        received = np.array(msg.data, dtype=np.float32)
+        if len(received) == 3:
+            self.base_lin_vel = np.array(received, dtype=np.float32)
+
     def isaac_to_mujoco(self, arr):
         """
         Convert a joint array from ONNX/IsaacLab order to MuJoCo/XML order.
@@ -1027,139 +635,47 @@ class RLPolicyNode(Node):
                 out[onnx_idx] = arr[xml_idx]
         return out
 
-    def obs_command_vel(self):
-        # if self.sim_time > 10 and self.sim_time <= 14:
-        #     self.cmd[0] = 0.6
-        # elif self.sim_time > 10 and self.sim_time <= 15:
-        #     self.cmd[0] = 0.4
-        #     self.cmd[2] = 0.2
-        # if self.sim_time > 8:
-        #     self.cmd[0] = 0.75
-        # if self.sim_time > 11:
-        #     self.cmd[0] = 0.3
-        # if self.sim_time > 14:
-        #     self.cmd[0] = 0.0
-        # if self.sim_time > 17:
-        #     self.cmd[0] = -0.3
-        # if self.sim_time > 20:
-        #     self.cmd[0] = -0.5
-        # if self.sim_time > 23:
-        #     self.cmd[0] = -0.3
-        # if self.sim_time > 26:
-        #     self.cmd[0] = 0.0
-        # self.cmd[2:] = 0
-        # if self.cmd[0] < 0.1 and self.cmd[0] > -0.1:
-        #     self.cmd[0] = 0.0
-        # if self.cmd[1] < 0.1 and self.cmd[1] > -0.1:
-        #     self.cmd[1] = 0.0
-        # if self.cmd[2] < 0.05 and self.cmd[2] > -0.05:
-        #     self.cmd[2] = 0.0
-        # print("cmd:", self.cmd)
-        # Return all 4 command elements: [vx, vy, vyaw, height]
-        # self.cmd[0] = 0.0
-        # self.cmd[1] = 0.0 
-        # self.cmd[2] = 0.0
-        # self.cmd[3] = 0.75
-        print("cmd:", self.cmd)
-        return self.cmd[:4]
-
-    def _compute_command_cache(
-        self, vel: np.ndarray, step: int
-    ) -> Optional[np.ndarray]:
-        if not (self.ik_enabled and self.velocity_grid is not None):
-            return None
-        found = self._find_closest_cached_velocity(
-            float(vel[0]), float(vel[1]) if len(vel) > 1 else 0.0
-        )
-        if found is None:
-            return None
-        _, _, idx = found
-        if idx is None or not (0 <= idx < len(self.ik_cache)):
-            return None
-        entry = self.ik_cache[idx]
-        if entry is None:
-            return None
-        pos_traj = entry[0] if len(entry) >= 1 else None
-        vel_traj = entry[1] if len(entry) >= 2 else None
-        if pos_traj is None or pos_traj.size == 0:
-            return None
-        T = pos_traj.shape[0]
-        if T <= 0:
-            return None
-        frame = step % T
-        print("frame:", frame)
-
-        ik_pos = pos_traj[frame]
-        if vel_traj is not None and vel_traj.shape[0] == T:
-            ik_vel = vel_traj[frame]
-        else:
-            ik_vel = np.zeros_like(ik_pos)
-        # command_vec = np.concatenate([ik_pos, ik_vel], axis=-1)
-        command_vec = ik_pos
-        max_abs = float(np.max(np.abs(command_vec))) if command_vec.size > 0 else 0.0
-        if max_abs > 1.0:
-            print(
-                f"[RLPolicyNode] Large command magnitude detected (|cmd|_max={max_abs:.2f}) at sim_time={self.sim_time:.3f}, frame={frame}",
-                flush=True,
-            )
-        self._record_command_stats(command_vec)
-        return command_vec
-
-    def _record_command_stats(self, command_vec: Optional[np.ndarray]) -> None:
-        if not (self.plot_enabled and command_vec is not None):
-            return
-        if command_vec.size < 2 * self.num_joints:
-            return
-        t = float(getattr(self, "sim_time", 0.0))
-        if (
-            self._last_plot_sample_time is not None
-            and abs(t - self._last_plot_sample_time) < 1e-6
-        ):
-            return
-        self._last_plot_sample_time = t
-        cmd_pos = command_vec[: self.num_joints]
-        cmd_vel = command_vec[self.num_joints : 2 * self.num_joints]
-        actual_pos = self.mujoco_to_isaac(self.qj)
-        actual_vel = self.mujoco_to_isaac(self.dqj)
-        joint0_cmd = float(cmd_pos[0]) if cmd_pos.size > 0 else 0.0
-        joint0_act = float(actual_pos[0]) if actual_pos.size > 0 else 0.0
-        joint0_cmd_vel = float(cmd_vel[0]) if cmd_vel.size > 0 else 0.0
-        joint0_act_vel = float(actual_vel[0]) if actual_vel.size > 0 else 0.0
-        self.plot_time_hist.append(t)
-        self.plot_cmd_joint0_hist.append(joint0_cmd)
-        self.plot_act_joint0_hist.append(joint0_act)
-        self.plot_cmd_vel0_hist.append(joint0_cmd_vel)
-        self.plot_act_vel0_hist.append(joint0_act_vel)
-        if len(self.plot_time_hist) > self.plot_max_points:
-            self.plot_time_hist = self.plot_time_hist[-self.plot_max_points :]
-            self.plot_cmd_joint0_hist = self.plot_cmd_joint0_hist[
-                -self.plot_max_points :
-            ]
-            self.plot_act_joint0_hist = self.plot_act_joint0_hist[
-                -self.plot_max_points :
-            ]
-            self.plot_cmd_vel0_hist = self.plot_cmd_vel0_hist[-self.plot_max_points :]
-            self.plot_act_vel0_hist = self.plot_act_vel0_hist[-self.plot_max_points :]
-        if (
-            t - self._last_plot_update_time
-        ) >= self.plot_update_interval:
-            self._last_plot_update_time = t
-            self.pos_cmd_line.set_data(self.plot_time_hist, self.plot_cmd_joint0_hist)
-            self.pos_act_line.set_data(self.plot_time_hist, self.plot_act_joint0_hist)
-            self.vel_cmd_line.set_data(self.plot_time_hist, self.plot_cmd_vel0_hist)
-            self.vel_act_line.set_data(self.plot_time_hist, self.plot_act_vel0_hist)
-            self.ax_pos.relim()
-            self.ax_pos.autoscale_view()
-            self.ax_vel.relim()
-            self.ax_vel.autoscale_view()
-            self.fig.canvas.draw_idle()
-            plt.pause(0.001)
-
     def obs_command(self):
-        # Find the closest cached IK trajectory to the current command velocity
-        vel = self.obs_command_vel()
-        step = int(self.sim_time / self.control_dt)
-        return self._compute_command_cache(vel, step)
+        # Map high-level velocity command into a 6D vector matching tracking env command order.
+        # Layout: [vx, vy, vz, roll, pitch, yaw]. Only vx, vy, yaw are provided; others are zeroed.
+        cmd = np.zeros(6, dtype=np.float32)
+        cmd[0] = float(self.cmd[0]) if len(self.cmd) > 0 else 0.0
+        cmd[1] = float(self.cmd[1]) if len(self.cmd) > 1 else 0.0
+        cmd[5] = float(self.cmd[2]) if len(self.cmd) > 2 else 0.0
+        return cmd
+
+    def obs_motion_anchor_pos_b(self):
+        # Anchor position in base frame not available from sim topics; return zeros placeholder.
+        return np.zeros(3, dtype=np.float32)
+
+    def obs_motion_anchor_ori_b(self):
+        # Anchor orientation in base frame not available; return zeros placeholder.
+        return np.zeros(3, dtype=np.float32)
+
+    def obs_base_lin_vel(self):
+        return self.base_lin_vel
+
+    def obs_base_ang_vel(self):
+        return self.omega
+
+    def obs_joint_pos(self):
+        joint_pos = self.mujoco_to_isaac(self.qj)
+        if hasattr(self, 'zero_joint_indices'):
+            joint_pos[self.zero_joint_indices] = self.default_joint_pos[self.zero_joint_indices]
+        if hasattr(self, 'free_joint_indices'):
+            joint_pos[self.free_joint_indices] = self.default_joint_pos[self.free_joint_indices]
+        return joint_pos - self.default_joint_pos
+
+    def obs_joint_vel(self):
+        joint_vel = self.mujoco_to_isaac(self.dqj)
+        if hasattr(self, 'zero_joint_indices'):
+            joint_vel[self.zero_joint_indices] = 0.0
+        if hasattr(self, 'free_joint_indices'):
+            joint_vel[self.free_joint_indices] = 0.0
+        return joint_vel
+
+    def obs_actions(self):
+        return self.action
 
     def obs_projected_gravity(self):
         qw = self.quat[0]
@@ -1174,34 +690,6 @@ class RLPolicyNode(Node):
         gravity_orientation[2] = 1 - 2 * (qw * qw + qz * qz)
 
         return gravity_orientation
-
-    def obs_base_ang_vel(self):
-        # print("omega:", self.omega)
-        return self.omega
-
-    def obs_joint_pos(self):
-        # print("qj:", self.qj)
-        joint_pos = self.mujoco_to_isaac(self.qj)
-        # Zero out wrist and waist joint positions
-        if hasattr(self, 'zero_joint_indices'):
-            joint_pos[self.zero_joint_indices] = self.default_joint_pos[self.zero_joint_indices]    
-        if hasattr(self, 'free_joint_indices'):
-            joint_pos[self.free_joint_indices] = self.default_joint_pos[self.free_joint_indices]
-        joint_pos -= self.default_joint_pos
-        return joint_pos
-
-    def obs_joint_vel(self):
-        # print("dqj:", self.dqj)
-        joint_vel = self.mujoco_to_isaac(self.dqj)
-        # Zero out wrist and waist joint velocities
-        if hasattr(self, 'zero_joint_indices'):
-            joint_vel[self.zero_joint_indices] = 0.0
-        if hasattr(self, 'free_joint_indices'):
-            joint_vel[self.free_joint_indices] = 0.0
-        return joint_vel
-
-    def obs_actions(self):
-        return self.action
 
     def construct_observations(self):
         """
