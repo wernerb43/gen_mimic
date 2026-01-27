@@ -37,6 +37,7 @@ class TargetPositionCommand(CommandTerm):
         self.robot: Articulation = env.scene[cfg.asset_name]
         print('body names:')
         print(self.robot.body_names)
+        self.robot_anchor_body_index = self.robot.body_names.index(self.cfg.anchor_body_name)
         self.target_body_index = self.robot.body_names.index(self.cfg.target_body_name)
         
         # Target position in world frame
@@ -69,8 +70,9 @@ class TargetPositionCommand(CommandTerm):
         ranges = torch.tensor(range_list, device=self.device)
         rand_samples = sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 3), device=self.device)
         
-        # Set target position in world frame (relative to env origin)
-        self.target_position_w[env_ids] = rand_samples + self._env.scene.env_origins[env_ids]
+        # Set target position in world frame relative to robot anchor body
+        anchor_pos_w = self.robot.data.body_pos_w[env_ids, self.robot_anchor_body_index]
+        self.target_position_w[env_ids] = rand_samples + anchor_pos_w
 
     def _update_command(self):
         """Update command each step - no changes needed for static targets."""
@@ -105,6 +107,7 @@ class TargetPositionCommand(CommandTerm):
         identity_quat = torch.zeros(self.num_envs, 4, device=self.device)
         identity_quat[:, 0] = 1.0
         self.target_visualizer.visualize(self.target_position_w, identity_quat)
+        print('Visualizing target at position:', self.target_position_w.cpu().numpy())
 
 @configclass
 class TargetPositionCommandCfg(CommandTermCfg):
@@ -115,10 +118,13 @@ class TargetPositionCommandCfg(CommandTermCfg):
     asset_name: str = MISSING
     """Name of the robot asset in the scene."""
 
+    anchor_body_name: str = MISSING
+    """Name of the anchor body used as reference for sampling target positions."""
+
     target_body_name: str = MISSING
     """Name of the body/link that should reach the target position (e.g., 'left_hand', 'right_hand')."""
 
-    target_range: dict[str, tuple[float, float]] = {"x": (0.0, 0.5), "y": (-0.3, 0.3), "z": (0.0, 0.5)}
+    target_range: dict[str, tuple[float, float]] = {"x": (0.0, 0.0), "y": (0.0, 0.0), "z": (0.0, 0.0)}
     """Range for sampling target positions (x, y, z) in meters."""
 
 
@@ -340,6 +346,7 @@ class MotionCommand(CommandTerm):
             return
         self._adaptive_sampling(env_ids)
 
+        # Set the root position to the body position in the motion
         root_pos = self.body_pos_w[:, 0].clone()
         root_ori = self.body_quat_w[:, 0].clone()
         root_lin_vel = self.body_lin_vel_w[:, 0].clone()

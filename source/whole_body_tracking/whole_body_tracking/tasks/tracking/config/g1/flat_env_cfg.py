@@ -39,6 +39,7 @@ class G1CatchingFlatEnvCfg(CatchingEnvCfg):
         self.scene.robot = G1_CYLINDER_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
         self.actions.joint_pos.scale = G1_ACTION_SCALE
         self.commands.motion.anchor_body_name = "torso_link"
+        self.commands.target_position.anchor_body_name = "torso_link"
         self.commands.motion.body_names = [
             "pelvis",
             "left_hip_roll_link",

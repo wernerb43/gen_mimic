@@ -104,9 +104,9 @@ class CommandsCfg:
         resampling_time_range=(5.0, 10.0),
         debug_vis=True,
         target_range={
-            "x": (0.2, 0.8),
-            "y": (-0.5, 0.5),
-            "z": (0.1, 0.8),
+            "x": (0.0, 0.0),
+            "y": (0.0, 0.0),
+            "z": (0.0, 0.0),
         },
     )
 
@@ -262,8 +262,8 @@ class RewardsCfg:
     )
     target_position_error = RewTerm(
         func=mdp.target_position_error_exp,
-        weight=2.0,
-        params={"command_name": "target_position", "std": 0.2},
+        weight=10.0,
+        params={"command_name": "target_position", "std": 2},
     )
 
 
