@@ -10,17 +10,6 @@ import sys
 import math
 import os
 
-# try:
-#     import matplotlib
-
-#     if not os.environ.get("DISPLAY") and os.name != "nt":
-#         matplotlib.use("Agg")
-#     import matplotlib.pyplot as plt
-
-#     MATPLOTLIB_AVAILABLE = True
-# except Exception:
-#     MATPLOTLIB_AVAILABLE = False
-
 # use python onnx package only (no onnxruntime)
 import onnx
 import json
@@ -57,9 +46,7 @@ class RLPolicyNode(Node):
         self.control_enable_sub = self.create_subscription(
             Float64, "control_enable", self.control_enable_callback, 10
         )
-        self.heightmap_sub = self.create_subscription(
-            Float32MultiArray, "height_map", self.heightmap_callback, 10
-        )
+
         self.base_lin_vel_sub = self.create_subscription(
             Float32MultiArray, "base_lin_vel", self.base_lin_vel_callback, 10
         )
@@ -85,9 +72,7 @@ class RLPolicyNode(Node):
             self.cmd = self.cmd_init.copy()
 
         # Lightweight state used by simplified node
-        self.height_map = np.full(
-            (self.N_grid_points,), float(self.height_offset), dtype=np.float32
-        )
+
         self.robot_position = np.zeros(3, dtype=np.float32)
         self.base_lin_vel = np.zeros(3, dtype=np.float32)
         self.qj = np.zeros(29, dtype=np.float32)
@@ -100,40 +85,6 @@ class RLPolicyNode(Node):
         # whether policy stepping has actually started (for one-time print)
         self._policy_started = False
         # Track last cache frame per velocity index to detect wraps
-        # Plotting state
-        self.plot_enabled = False
-        self.plot_max_points = 1000
-        self.plot_update_interval = 0.05
-        self._last_plot_update_time = 0.0
-        self._last_plot_sample_time: Optional[float] = None
-        self.plot_time_hist: List[float] = []
-        self.plot_cmd_joint0_hist: List[float] = []
-        self.plot_act_joint0_hist: List[float] = []
-        self.plot_cmd_vel0_hist: List[float] = []
-        self.plot_act_vel0_hist: List[float] = []
-        # if MATPLOTLIB_AVAILABLE:
-        #     try:
-        #         plt.ion()
-        #         self.fig, (self.ax_pos, self.ax_vel) = plt.subplots(
-        #             2, 1, sharex=True, figsize=(8, 6)
-        #         )
-        #         self.pos_cmd_line, = self.ax_pos.plot([], [], label="cmd joint0")
-        #         self.pos_act_line, = self.ax_pos.plot([], [], label="act joint0")
-        #         self.ax_pos.set_ylabel("Joint0 pos (rad)")
-        #         self.ax_pos.legend(loc="upper right")
-        #         self.vel_cmd_line, = self.ax_vel.plot([], [], label="cmd vel0")
-        #         self.vel_act_line, = self.ax_vel.plot([], [], label="act vel0")
-        #         self.ax_vel.set_ylabel("Joint0 vel (rad/s)")
-        #         self.ax_vel.set_xlabel("Time (s)")
-        #         self.ax_vel.legend(loc="upper right")
-        #         self.plot_enabled = True
-        #     except Exception as exc:
-        #         print(
-        #             f"[RLPolicyNode] Failed to initialize command plot: {exc}",
-        #             flush=True,
-        #         )
-        #         self.plot_enabled = False
-
 
     def load_config(self):
         G1_RL_ROOT_DIR = os.getenv("G1_RL_ROOT_DIR")
@@ -145,7 +96,6 @@ class RLPolicyNode(Node):
             "{G1_RL_ROOT_DIR}", G1_RL_ROOT_DIR
         )
         self.use_gpu = config.get("use_gpu", False)
-        self.use_height_map = config.get("use_height_map", False)
 
         self.xml_path = config.get("xml_path", "").replace(
             "{G1_RL_ROOT_DIR}", G1_RL_ROOT_DIR
@@ -153,17 +103,6 @@ class RLPolicyNode(Node):
         self.robot_xml_path = config.get("robot_xml_path", self.xml_path).replace(
             "{G1_RL_ROOT_DIR}", G1_RL_ROOT_DIR
         )
-
-        self.grid_size_x = float(config.get("grid_size_x", 1.0))
-        self.grid_size_y = float(config.get("grid_size_y", 1.0))
-        self.resolution = float(config.get("resolution", 0.1))
-        self.forward_offset = float(config.get("forward_offset", 0.0))
-        self.grid_points_x = int(config.get("grid_points_x", 1))
-        self.grid_points_y = int(config.get("grid_points_y", 1))
-        self.N_grid_points = int(
-            config.get("N_grid_points", self.grid_points_x * self.grid_points_y)
-        )
-        self.height_offset = float(config.get("height_offset", 0.5))
 
         # timing
         self.simulation_dt = float(config.get("simulation_dt", 0.002))
@@ -277,7 +216,7 @@ class RLPolicyNode(Node):
                 f"Failed to convert 'default_joint_pos' from metadata to numpy array: {e}"
             )
 
-        # --- NEW: Load p_gain and d_gain from metadata ---
+        # --- Load p_gain and d_gain from metadata ---
         joint_stiffness = parsed_meta.get("joint_stiffness", None)
         joint_damping = parsed_meta.get("joint_damping", None)
         if joint_stiffness is None or joint_damping is None:
@@ -285,8 +224,10 @@ class RLPolicyNode(Node):
                 "Embedded ONNX metadata missing required 'joint_stiffness' or 'joint_damping' entry."
             )
         try:
-            self.p_gain = np.array(joint_stiffness, dtype=np.float32)
-            self.d_gain = np.array(joint_damping, dtype=np.float32)
+            # These are in ONNX order, will be converted to XML order below
+            onnx_p_gain = np.array(joint_stiffness, dtype=np.float32)
+            onnx_d_gain = np.array(joint_damping, dtype=np.float32)
+            print("[RLPolicyNode] Using gains from ONNX metadata")
         except Exception as e:
             raise RuntimeError(
                 f"Failed to convert joint_stiffness/damping from metadata to numpy array: {e}"
@@ -306,13 +247,17 @@ class RLPolicyNode(Node):
             self._create_joint_order_mappings(self.xml_joint_names, self.joint_names)
         )
         
+        # Convert ONNX-order gains to XML/MuJoCo order
+        self.p_gain = self.isaac_to_mujoco(onnx_p_gain)
+        self.d_gain = self.isaac_to_mujoco(onnx_d_gain)
+        
         # Identify wrist and waist joint indices in ONNX order to zero out
         self.zero_joint_indices = []
-        zero_joint_patterns = ['waist_roll', 'waist_pitch']
-        for i, name in enumerate(self.joint_names):
-            if any(pattern in name for pattern in zero_joint_patterns):
-                self.zero_joint_indices.append(i)
-        print(f"Zero joint indices (ONNX order): {self.zero_joint_indices}")
+        # zero_joint_patterns = ['waist_roll', 'waist_pitch']
+        # for i, name in enumerate(self.joint_names):
+        #     if any(pattern in name for pattern in zero_joint_patterns):
+        #         self.zero_joint_indices.append(i)
+        # print(f"Zero joint indices (ONNX order): {self.zero_joint_indices}")
 
         self.free_joint_indices = []
         # free_joint_patterns = ['left_shoulder_pitch_joint', 'right_shoulder_pitch_joint', 'left_shoulder_roll_joint', 'right_shoulder_roll_joint', 'left_shoulder_yaw_joint', 'right_shoulder_yaw_joint', 'left_elbow_joint', 'right_elbow_joint', 'left_wrist_roll_joint', 'right_wrist_roll_joint', 'left_wrist_pitch_joint', 'right_wrist_pitch_joint', 'left_wrist_yaw_joint', 'right_wrist_yaw_joint']
@@ -354,8 +299,8 @@ class RLPolicyNode(Node):
         print("default_joint_pos:", self.isaac_to_mujoco(self.default_joint_pos))
         print(f"mujoco joint names: {self.xml_joint_names}")
         print(f"onnx joint names: {self.joint_names}")
-        print(f"p_gain: {self.isaac_to_mujoco(self.p_gain)}")
-        print(f"d_gain: {self.isaac_to_mujoco(self.d_gain)}")
+        print(f"p_gain: {self.p_gain}")
+        print(f"d_gain: {self.d_gain}")
         print(f"observation_names: {self.observation_names}")
         print(f"command_names: {self.command_names}")
 
@@ -588,8 +533,8 @@ class RLPolicyNode(Node):
                 # if hasattr(self, 'zero_joint_indices'):
                 #     action[self.zero_joint_indices] = 0.0
                 self.action = action.copy()
-                if hasattr(self, 'zero_joint_indices'):
-                    action[self.zero_joint_indices] = 0.0
+                # if hasattr(self, 'zero_joint_indices'):
+                #     action[self.zero_joint_indices] = 0.0
                 p_gain = self.p_gain.astype(np.float32)
                 d_gain = self.d_gain.astype(np.float32)
                 # Concatenate [action, p_gain, d_gain]
@@ -620,9 +565,9 @@ class RLPolicyNode(Node):
                 exit(0)
 
 
-    def pd_control(self, target_q, q, kp, target_dq, dq, kd):
-        """Calculates torques from position commands"""
-        return (target_q - q) * kp + (target_dq - dq) * kd
+    # def pd_control(self, target_q, q, kp, target_dq, dq, kd):
+    #     """Calculates torques from position commands"""
+    #     return (target_q - q) * kp + (target_dq - dq) * kd
 
     # Remove all pinocchio/cbf/obstacle xml parsing methods
 
@@ -650,10 +595,6 @@ class RLPolicyNode(Node):
 
     def time_callback(self, msg):
         self.sim_time = msg.data
-
-    def heightmap_callback(self, msg):
-        received = np.array(msg.data, dtype=np.float32)
-        self.height_map[: received.shape[0]] = received
 
     def base_lin_vel_callback(self, msg):
         received = np.array(msg.data, dtype=np.float32)
@@ -842,7 +783,6 @@ class RLPolicyNode(Node):
             if obs_val is None:
                 raise RuntimeError(f"Observation function '{func_name}' returned None.")
             obs_list.append(np.asarray(obs_val, dtype=np.float32))
-        print(obs_list)
         return np.concatenate(obs_list, axis=-1)
 
 

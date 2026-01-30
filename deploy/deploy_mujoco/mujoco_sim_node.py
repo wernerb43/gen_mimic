@@ -1,4 +1,4 @@
-# Copyright (c) 2025 Lizhi Yang AMBER LAB
+# Copyright (c) 2025 Blake Werner, Lizhi Yang AMBER LAB
 
 import argparse
 import os
@@ -18,7 +18,7 @@ from std_msgs.msg import Float32MultiArray, Float64
 
 
 class MujocoSimNode(Node):
-    def __init__(self, config_file="g1_21dof.yaml"):
+    def __init__(self, config_file):
 
         super().__init__("mujoco_sim_node")
         self.config_file = config_file
@@ -27,12 +27,7 @@ class MujocoSimNode(Node):
             Float32MultiArray, "robot_position", 10
         )
         self.time_pub = self.create_publisher(Float64, "sim_time", 10)
-        self.foot_forces_pub = self.create_publisher(
-            Float32MultiArray, "foot_forces", 10
-        )
-        self.ankle_heights_pub = self.create_publisher(
-            Float32MultiArray, "ankle_heights", 10
-        )
+        
         self.height_map_pub = self.create_publisher(Float32MultiArray, "height_map", 10)
         self.base_lin_vel_pub = self.create_publisher(
             Float32MultiArray, "base_lin_vel", 10
@@ -84,14 +79,6 @@ class MujocoSimNode(Node):
         # Optionally, also set target positions to match initial
         self.target_dof_pos = initial_joint_values.copy()
 
-        # Find foot body IDs
-        self.left_foot_id = mujoco.mj_name2id(
-            self.m, mujoco.mjtObj.mjOBJ_BODY, "left_ankle_roll_link"
-        )
-        self.right_foot_id = mujoco.mj_name2id(
-            self.m, mujoco.mjtObj.mjOBJ_BODY, "right_ankle_roll_link"
-        )
-
         # Launch the viewer in passive mode
         self.viewer = mujoco.viewer.launch_passive(self.m, self.d)
         # self.viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_CONTACTFORCE] = 1
@@ -100,46 +87,12 @@ class MujocoSimNode(Node):
 
 
     def action_callback(self, msg):
-        # Expect msg.data to be [position, p, d] repeated for each joint
+        # Expect msg.data to be [position, p, d] 
         arr = np.array(msg.data, dtype=np.float32)
         n = arr.shape[0] // 3
         self.target_dof_pos = arr[:n]
         self.target_dof_p = arr[n : 2 * n]
         self.target_dof_d = arr[2 * n : 3 * n]
-
-    def get_foot_forces(self):
-        """Extract contact forces for both feet"""
-        left_force = np.zeros(3)
-        right_force = np.zeros(3)
-
-        # Iterate through all contacts
-        for i in range(self.d.ncon):
-            contact = self.d.contact[i]
-            geom1_body = self.m.geom_bodyid[contact.geom1]
-            geom2_body = self.m.geom_bodyid[contact.geom2]
-
-            # Check if contact involves foot bodies
-            if geom1_body == self.left_foot_id or geom2_body == self.left_foot_id:
-                # Get contact force
-                c_array = np.zeros(6, dtype=np.float64)
-                mujoco.mj_contactForce(self.m, self.d, i, c_array)
-                force = c_array[:3]  # First 3 elements are force
-                left_force += np.abs(force)  # Sum absolute forces
-
-            if geom1_body == self.right_foot_id or geom2_body == self.right_foot_id:
-                # Get contact force
-                c_array = np.zeros(6, dtype=np.float64)
-                mujoco.mj_contactForce(self.m, self.d, i, c_array)
-                force = c_array[:3]  # First 3 elements are force
-                right_force += np.abs(force)  # Sum absolute forces
-
-        return left_force, right_force
-
-    def get_ankle_heights(self):
-        """Extract world Z positions of ankle links"""
-        left_height = self.d.xpos[self.left_foot_id][2]  # Z coordinate
-        right_height = self.d.xpos[self.right_foot_id][2]  # Z coordinate
-        return left_height, right_height
 
     def sim_step(self):
         self.viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
@@ -177,23 +130,9 @@ class MujocoSimNode(Node):
                 pass
         # Apply action if available
         # if self.action is not None:
-        #     self.target_dof_pos = self.action * self.action_scale + self.default_angles
+            # self.target_dof_pos = self.action * self.action_scale + self.default_angles
         self.d.ctrl[: self.num_joints] = self.target_dof_pos
-        self.d.ctrl[self.num_joints :] = 0.0  # Ensure the rest of the controls are zero
 
-        # Update PD gains for each joint from self.target_dof_p and self.target_dof_d
-        # for i in range(self.num_joints):
-        #     self.m.jnt_stiffness[i] = self.target_dof_p[i]
-        #     self.m.dof_damping[i] = self.target_dof_d[i]
-
-        # fix robot
-        # self.d.qpos[0] = 0
-        # self.d.qpos[1] = 0
-        # self.d.qpos[2] = 0.78  # Set pelvis height
-        # self.d.qpos[3] = 1.0  # Set pelvis orientation
-        # self.d.qpos[4] = 0.0  # Set pelvis orientation
-        # self.d.qpos[5] = 0.0  # Set pelvis orientation
-        # self.d.qpos[6] = 0.0  # Set pelvis orientation
         mujoco.mj_step(self.m, self.d)
 
         # Prepare sensor data
@@ -232,18 +171,6 @@ class MujocoSimNode(Node):
             self._control_enable_sent = True
             print(f"[MujocoSimNode] Published control_enable=1.0 at sim_time={self.d.time:.3f}", flush=True)
 
-        # Publish foot forces
-        left_force, right_force = self.get_foot_forces()
-        foot_forces_msg = Float32MultiArray()
-        foot_forces_msg.data = np.concatenate([left_force, right_force]).tolist()
-        self.foot_forces_pub.publish(foot_forces_msg)
-
-        # Publish ankle heights
-        left_height, right_height = self.get_ankle_heights()
-        ankle_heights_msg = Float32MultiArray()
-        ankle_heights_msg.data = [left_height, right_height]
-        self.ankle_heights_pub.publish(ankle_heights_msg)
-
         # Publish base linear velocity (from first 3 elements of qvel)
         base_lin_vel = self.d.qvel[0:3]
         base_lin_vel_msg = Float32MultiArray()
@@ -273,7 +200,7 @@ def main(args=None):
         "--config",
         type=str,
         required=True,
-        help="Config file name (e.g., g1_21dof.yaml)",
+        help="Config file name (e.g., g1_29dof.yaml)",
     )
     args = parser.parse_args()
     node = MujocoSimNode(config_file=args.config)

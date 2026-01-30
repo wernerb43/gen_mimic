@@ -38,7 +38,6 @@ from nav_msgs.msg import GridCells
 # from rcl_interfaces.srv import SetParameters
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
-from geometry_msgs.msg import Pose
 from std_msgs.msg import Float32, Float32MultiArray, Bool
 from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import (
     MotionSwitcherClient,
@@ -63,11 +62,6 @@ from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_ as LowCmdHG
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_ as LowStateHG
 from unitree_sdk2py.utils.crc import CRC
-
-# import pinocchio as pin
-from arm_utils import G1_29_ArmIK, G1_29_JointArmIndex
-
-
 
 class PolicyModes(Enum):
     Walk = 0
@@ -233,8 +227,6 @@ class Controller(Node):
         # Teleoperation Subscribers
         self.create_subscription(Float32MultiArray, 'xr/left_thumbstick_value', self.teleop_vel_callback, 10)
         self.create_subscription(Float32MultiArray, 'xr/right_thumbstick_value', self.teleop_yaw_callback, 10)
-        self.create_subscription(Pose, 'xr/left_wrist_pose', self.teleop_left_hand_callback, 10)
-        self.create_subscription(Pose, 'xr/right_wrist_pose', self.teleop_right_hand_callback, 10)
         
         self.create_subscription(Bool, 'xr/right_aButton', self.teleop_right_a_callback, 10)
         self.create_subscription(Bool, 'xr/right_bButton', self.teleop_right_b_callback, 10)
@@ -343,31 +335,9 @@ class Controller(Node):
         self.current_mode = self.policy_modes.Walk
         self.joint_states_pub = self.create_publisher(JointState, "/joint_states", 10)
 
-        # Initialize Arm IK
-        self.ik_lock = threading.Lock()
-        self.arm_ik_solution = None
-        self.ik_running = False
+        # Load motion trajectory from npz file if provided
+        self.load_motion_trajectory()
         
-        try:
-            self.arm_ik = G1_29_ArmIK(self.urdf_path)
-            self.arm_q_target = np.zeros(14)
-            self.left_hand_pose = np.eye(4)
-            self.right_hand_pose = np.eye(4)
-            # Set initial hand poses (approximate, should be set by user/logic)
-            self.left_hand_pose[:3, 3] = [0.3, 0.3, 0.0]
-            self.right_hand_pose[:3, 3] = [0.3, -0.3, 0.0]
-            self.use_arm_ik = False # Disabled by default until explicitly enabled
-            
-            self.ik_running = True
-            self.ik_thread = threading.Thread(target=self._run_arm_ik_loop, daemon=True)
-            self.ik_thread.start()
-            
-            print("Arm IK initialized successfully")
-        except Exception as e:
-            print(f"Failed to initialize Arm IK: {e}")
-            self.arm_ik = None
-            self.use_arm_ik = False
-
         # Start ROS2 spinning now that everything is initialized
         self.ros_thread.start()
 
@@ -400,6 +370,11 @@ class Controller(Node):
         self.msg_type = config.get("msg_type", "hg")
         self.imu_type = config.get("imu_type", "pelvis")
         self.weak_motor = config.get("weak_motor", False)
+        
+        # motion trajectory npz file
+        self.motion_npz_path = config.get("motion_npz_path", "")
+        if self.motion_npz_path:
+            self.motion_npz_path = self.motion_npz_path.replace("{G1_RL_ROOT_DIR}", G1_RL_ROOT_DIR)
 
     def load_policy(self):
         self.onnx_model = None
@@ -445,6 +420,42 @@ class Controller(Node):
             raise RuntimeError(
                 f"Failed to load or validate ONNX model at '{self.policy_path}': {e}"
             )
+
+    def load_motion_trajectory(self):
+        """
+        Load motion trajectory from npz file. The npz file should contain:
+        - fps: output fps of the motion
+        - joint_pos: shape (T, num_joints)
+        - joint_vel: shape (T, num_joints)
+        - body_pos_w: shape (T, num_bodies, 3)
+        - body_quat_w: shape (T, num_bodies, 4)
+        - body_lin_vel_w: shape (T, num_bodies, 3)
+        - body_ang_vel_w: shape (T, num_bodies, 3)
+        """
+        self.motion_trajectory = None
+        self.motion_frame_idx = 0
+        
+        if not self.motion_npz_path or self.motion_npz_path == "":
+            self.get_logger().info("No motion trajectory file specified, using zero placeholders")
+            return
+        
+        try:
+            if not os.path.exists(self.motion_npz_path):
+                self.get_logger().warn(f"Motion npz file not found: {self.motion_npz_path}")
+                return
+            
+            self.motion_trajectory = np.load(self.motion_npz_path)
+            motion_fps = self.motion_trajectory["fps"]
+            num_frames = self.motion_trajectory["joint_pos"].shape[0]
+            num_bodies = self.motion_trajectory["body_pos_w"].shape[1]
+            
+            self.get_logger().info(
+                f"Loaded motion trajectory from {self.motion_npz_path}: "
+                f"{num_frames} frames at {motion_fps} fps, {num_bodies} bodies"
+            )
+        except Exception as e:
+            self.get_logger().error(f"Failed to load motion trajectory: {e}")
+            self.motion_trajectory = None
 
     def load_policy_metadata(self):
         try:
@@ -603,8 +614,7 @@ class Controller(Node):
         print(f"Gain add motor indices (MuJoCo/hardware order): {self.gain_add_motor_indices}")
 
         self.free_joint_indices = []
-        free_joint_patterns = ['left_shoulder_pitch_joint', 'right_shoulder_pitch_joint', 'left_shoulder_roll_joint', 'right_shoulder_roll_joint', 'left_shoulder_yaw_joint', 'right_shoulder_yaw_joint', 'left_elbow_joint', 'right_elbow_joint', 'left_wrist_roll_joint', 'right_wrist_roll_joint', 'left_wrist_pitch_joint', 'right_wrist_pitch_joint', 'left_wrist_yaw_joint', 'right_wrist_yaw_joint']
-        # free_joint_patterns = []
+        free_joint_patterns = []
         for i, name in enumerate(self.joint_names):
             if any(pattern in name for pattern in free_joint_patterns):
                 self.free_joint_indices.append(i)
@@ -920,21 +930,6 @@ class Controller(Node):
             joint_pos[self.free_joint_indices] = self.default_joint_pos[self.free_joint_indices]
         joint_pos_mujoco = self.isaac_to_mujoco(joint_pos)
 
-        # Apply Arm IK if enabled
-        if self.use_arm_ik and self.arm_ik:
-            with self.ik_lock:
-                if self.arm_ik_solution is not None:
-                    # Overwrite joint_pos_mujoco with IK solution
-                    for i, idx in enumerate(G1_29_JointArmIndex):
-                        motor_id = idx.value
-                        if motor_id < len(joint_pos_mujoco):
-                            joint_pos_mujoco[motor_id] = self.arm_ik_solution[i]
-                else: # set to default position
-                    for i, idx in enumerate(G1_29_JointArmIndex):
-                        motor_id = idx.value
-                        if motor_id < len(joint_pos_mujoco):    
-                            joint_pos_mujoco[motor_id] = self.default_joint_pos_mujoco[motor_id]
-
         # Build low cmd
         for step in range(1):
             for i in range(len(self.dof_idx_full)):
@@ -952,39 +947,20 @@ class Controller(Node):
                     # Normal control for active motors
                     self.low_cmd.motor_cmd[motor_idx].q = joint_pos_mujoco[i]
                     self.low_cmd.motor_cmd[motor_idx].qd = 0
-                    self.low_cmd.motor_cmd[motor_idx].kp = self.p_gain_mujoco[i] if i not in [member.value for member in G1_29_JointArmIndex] else self.p_gain_mujoco[i]
-                    self.low_cmd.motor_cmd[motor_idx].kd = self.d_gain_mujoco[i] if i not in [member.value for member in G1_29_JointArmIndex] else self.d_gain_mujoco[i]
+                    self.low_cmd.motor_cmd[motor_idx].kp = self.p_gain_mujoco[i]
+                    self.low_cmd.motor_cmd[motor_idx].kd = self.d_gain_mujoco[i]
                     self.low_cmd.motor_cmd[motor_idx].tau = 0
                     self.low_cmd.motor_cmd[motor_idx].mode = 1  # 1:Enable
 
             # send the command
             self.send_cmd(self.low_cmd)
-            time.sleep(self.control_dt)
-
-    def _run_arm_ik_loop(self):
-        while self.ik_running:
-            if self.use_arm_ik and self.arm_ik:
-                try:
-                    # Get current state safely
-                    current_arm_q = self.get_current_arm_q()
-                    with self.ik_lock:
-                        target_l = self.left_hand_pose.copy()
-                        target_r = self.right_hand_pose.copy()
-                    
-                    # Solve IK (this is the heavy operation)
-                    sol_q, _ = self.arm_ik.solve_ik(target_l, target_r, current_arm_q)
-                    
-                    # Update solution safely
-                    with self.ik_lock:
-                        self.arm_ik_solution = sol_q
-                except Exception as e:
-                    print(f"Arm IK Thread Error: {e}")
-                    time.sleep(0.1)
-            else:
-                time.sleep(0.1)
             
-            # Sleep a bit to yield
-            time.sleep(0.002)
+            # Increment motion frame index (if trajectory is loaded)
+            if self.motion_trajectory is not None:
+                num_frames = self.motion_trajectory["joint_pos"].shape[0]
+                self.motion_frame_idx = (self.motion_frame_idx + 1) % num_frames
+            
+            time.sleep(self.control_dt)
 
     def _parse_joint_names_from_xml(self, xml_path):
         joint_names = []
@@ -1036,6 +1012,120 @@ class Controller(Node):
     def obs_command_vel(self):
         return self.cmd[:4]
 
+    def obs_command(self):
+        # Return motion trajectory command: [joint_pos (motion), joint_vel (motion)]
+        # This is the desired joint configuration and velocities from the motion being replayed
+        # Size: 2 * num_joints (e.g., 58 for 29-DOF robot)
+        if self.motion_trajectory is not None:
+            try:
+                joint_pos = self.motion_trajectory["joint_pos"][self.motion_frame_idx]
+                joint_vel = self.motion_trajectory["joint_vel"][self.motion_frame_idx]
+                cmd = np.concatenate([joint_pos, joint_vel]).astype(np.float32)
+                return cmd
+            except Exception as e:
+                self.get_logger().warn(f"Error extracting motion command: {e}")
+        return np.zeros(2 * self.num_joints, dtype=np.float32)
+    
+    def obs_motion_anchor_pos_b(self):
+        # Return motion anchor body position error in robot base frame
+        # This is: motion_anchor_pos_w - robot_anchor_pos_w, transformed to robot base frame
+        if self.motion_trajectory is not None:
+            try:
+                # Anchor body is typically the first body (index 0, pelvis/base)
+                motion_anchor_pos = self.motion_trajectory["body_pos_w"][self.motion_frame_idx, 0]  # (3,)
+                
+                # Robot anchor position from low state (base position)
+                robot_anchor_pos = np.array([
+                    self.low_state.position[0],
+                    self.low_state.position[1],
+                    self.low_state.position[2]
+                ], dtype=np.float32)
+                
+                # Position difference in world frame
+                pos_error_w = motion_anchor_pos - robot_anchor_pos
+                
+                # Transform to robot base frame using quaternion from IMU
+                q = np.array([
+                    self.low_state.imu_state.quaternion[0],
+                    self.low_state.imu_state.quaternion[1],
+                    self.low_state.imu_state.quaternion[2],
+                    self.low_state.imu_state.quaternion[3]
+                ], dtype=np.float32)
+                q_inv = self._quat_conjugate(q)
+                pos_error_b = self._quat_rotate(q_inv, pos_error_w)
+                
+                return pos_error_b.astype(np.float32)
+            except Exception as e:
+                self.get_logger().warn(f"Error computing motion anchor position: {e}")
+        return np.zeros(3, dtype=np.float32)
+    
+    def obs_motion_anchor_ori_b(self):
+        # Return motion anchor body orientation error in robot base frame as 6D encoding
+        # Format: [r00, r01, r10, r11, r20, r21] - first two columns of 3x3 rotation matrix
+        if self.motion_trajectory is not None:
+            try:
+                # Get motion anchor orientation (first body, pelvis/base)
+                motion_anchor_quat = self.motion_trajectory["body_quat_w"][self.motion_frame_idx, 0]  # (4,) wxyz
+                
+                # Robot anchor orientation from IMU
+                robot_anchor_quat = np.array([
+                    self.low_state.imu_state.quaternion[0],
+                    self.low_state.imu_state.quaternion[1],
+                    self.low_state.imu_state.quaternion[2],
+                    self.low_state.imu_state.quaternion[3]
+                ], dtype=np.float32)
+                
+                # Compute relative quaternion: quat_error = quat_robot_inv * quat_motion
+                q_inv = self._quat_conjugate(robot_anchor_quat)
+                q_rel = self._quat_multiply(q_inv, motion_anchor_quat)
+                
+                # Convert quaternion to rotation matrix
+                rot_mat = self._quat_to_rotation_matrix(q_rel)
+                
+                # Extract 6D encoding: [r00, r01, r10, r11, r20, r21]
+                ori_6d = np.array([
+                    rot_mat[0, 0], rot_mat[0, 1],
+                    rot_mat[1, 0], rot_mat[1, 1],
+                    rot_mat[2, 0], rot_mat[2, 1]
+                ], dtype=np.float32)
+                
+                return ori_6d
+            except Exception as e:
+                self.get_logger().warn(f"Error computing motion anchor orientation: {e}")
+        return np.zeros(6, dtype=np.float32)
+
+    def _quat_conjugate(self, q: np.ndarray) -> np.ndarray:
+        """Compute quaternion conjugate. Input/output format: [w, x, y, z]"""
+        return np.array([q[0], -q[1], -q[2], -q[3]], dtype=np.float32)
+    
+    def _quat_multiply(self, q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+        """Multiply two quaternions. Input/output format: [w, x, y, z]"""
+        w1, x1, y1, z1 = q1
+        w2, x2, y2, z2 = q2
+        return np.array([
+            w1*w2 - x1*x2 - y1*y2 - z1*z2,
+            w1*x2 + x1*w2 + y1*z2 - z1*y2,
+            w1*y2 - x1*z2 + y1*w2 + z1*x2,
+            w1*z2 + x1*y2 - y1*x2 + z1*w2
+        ], dtype=np.float32)
+    
+    def _quat_rotate(self, q: np.ndarray, v: np.ndarray) -> np.ndarray:
+        """Rotate vector v by quaternion q. q format: [w, x, y, z]"""
+        # v' = q * v * q_inv where v is treated as [0, vx, vy, vz]
+        v_quat = np.array([0.0, v[0], v[1], v[2]], dtype=np.float32)
+        q_inv = self._quat_conjugate(q)
+        result = self._quat_multiply(q, self._quat_multiply(v_quat, q_inv))
+        return result[1:4]  # Return [x, y, z]
+    
+    def _quat_to_rotation_matrix(self, q: np.ndarray) -> np.ndarray:
+        """Convert quaternion to 3x3 rotation matrix. q format: [w, x, y, z]"""
+        w, x, y, z = q
+        return np.array([
+            [1 - 2*(y*y + z*z), 2*(x*y - w*z), 2*(x*z + w*y)],
+            [2*(x*y + w*z), 1 - 2*(x*x + z*z), 2*(y*z - w*x)],
+            [2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x*x + y*y)]
+        ], dtype=np.float32)
+
     def obs_projected_gravity(self):
         quat = self.low_state.imu_state.quaternion
         qw = quat[0]
@@ -1050,6 +1140,21 @@ class Controller(Node):
         gravity_orientation[2] = 1 - 2 * (qw * qw + qz * qz)
 
         return gravity_orientation
+
+    def obs_base_lin_vel(self):
+        # Try multiple sources; fall back to zeros if not available
+        for src in (getattr(self, "odom_state", None), getattr(self, "low_state", None)):
+            if src is None:
+                continue
+            for attr in ("velocity", "vel", "v"):
+                if hasattr(src, attr):
+                    v = getattr(src, attr)
+                    try:
+                        if len(v) >= 3:
+                            return np.array([v[0], v[1], v[2]], dtype=np.float32)
+                    except Exception:
+                        pass
+        return np.zeros(3, dtype=np.float32)
 
     def obs_base_ang_vel(self):
         ang_vel = np.array([self.low_state.imu_state.gyroscope], dtype=np.float32)
@@ -1193,37 +1298,6 @@ class Controller(Node):
     def teleop_right_squeeze_callback(self, msg):
         self.teleop_buttons['right_squeeze'] = msg.data
             
-    def teleop_left_hand_callback(self, msg):
-        # Update left hand pose target
-        with self.ik_lock:
-            self.left_hand_pose = self._pose_msg_to_matrix(msg)
-            self.use_arm_ik = True # Enable IK when receiving hand poses
-
-    def teleop_right_hand_callback(self, msg):
-        # Update right hand pose target
-        with self.ik_lock:
-            self.right_hand_pose = self._pose_msg_to_matrix(msg)
-            self.use_arm_ik = True
-
-    def _pose_msg_to_matrix(self, pose_msg):
-        # Helper to convert Pose msg to 4x4 matrix
-        # Requires scipy or manual conversion. Let's do manual for minimal deps.
-        # q = [x, y, z, w]
-        x, y, z, w = pose_msg.orientation.x, pose_msg.orientation.y, pose_msg.orientation.z, pose_msg.orientation.w
-        tx, ty, tz = pose_msg.position.x, pose_msg.position.y, pose_msg.position.z
-        
-        # Quaternion to rotation matrix
-        R = np.array([
-            [1 - 2*y*y - 2*z*z, 2*x*y - 2*z*w, 2*x*z + 2*y*w],
-            [2*x*y + 2*z*w, 1 - 2*x*x - 2*z*z, 2*y*z - 2*x*w],
-            [2*x*z - 2*y*w, 2*y*z + 2*x*w, 1 - 2*x*x - 2*y*y]
-        ])
-        
-        T = np.eye(4)
-        T[:3, :3] = R
-        T[:3, 3] = [tx, ty, tz]
-        return T
-
     def main_loop(self):
         """Main control loop that runs the state machine"""
         print("Starting main control loop...")
@@ -1259,15 +1333,6 @@ class Controller(Node):
             self.send_cmd(self.low_cmd)
             raise
 
-
-    def get_current_arm_q(self):
-        q = np.zeros(14)
-        for i, idx in enumerate(G1_29_JointArmIndex):
-            motor_id = idx.value
-            if motor_id < len(self.low_state.motor_state):
-                q[i] = self.low_state.motor_state[motor_id].q
-        return q
-
 def main():
     import argparse
 
@@ -1295,11 +1360,8 @@ def main():
     finally:
         # Stop ROS2 spinning thread
         controller.ros_running = False
-        controller.ik_running = False # Stop IK thread
         if controller.ros_thread.is_alive():
             controller.ros_thread.join(timeout=1.0)
-        if hasattr(controller, 'ik_thread') and controller.ik_thread.is_alive():
-            controller.ik_thread.join(timeout=1.0)
         # Cleanup ROS2
         controller.destroy_node()
         rclpy.shutdown()

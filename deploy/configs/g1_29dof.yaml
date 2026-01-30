@@ -3,13 +3,13 @@
 # policy_path: "/home/yangl/BeyondMimic/whole_body_tracking/logs/rsl_rl/g1_flat/2025-11-30_01-26-21_squat_walk_full/exported/policy.onnx"
 # policy_path: "/home/yangl/BeyondMimic/whole_body_tracking/logs/rsl_rl/g1_flat/2025-12-01_18-54-15_walk_0.75_fixed_arm/exported/policy.onnx"
 # policy_path: "/home/yangl/BeyondMimic/whole_body_tracking/logs/rsl_rl/g1_flat/2025-12-02_09-21-26_2025-12-01_18-54-15_walk_squat_rand_arm/exported/policy.onnx" 
-policy_path: "/home/blake/gen_mimic/logs/rsl_rl/g1_flat/2026-01-27_10-53-58_throw_neutral_2_run/2026-01-27_10-53-58_throw_neutral_2_run.onnx"
+policy_path: "/home/blake/gen_mimic/logs/rsl_rl/2026-01-28_17-56-59_toss_2_talos.onnx"
 use_gpu: True
 plot_feet: False
 
 # Motion trajectory file (npz format from csv_to_npz.py)
 # Set to empty string or null to disable motion trajectory observations
-motion_npz_path: "/home/blake/gen_mimic/artifacts/throw_neutral_2:v0/motion.npz"
+motion_npz_path: "/home/blake/gen_mimic/artifacts/toss_2:v0/motion.npz"
 
 # stand_policy_path: "{G1_RL_ROOT_DIR}/deploy/ckpts/policy_0.85_extended.pt"
 # xml_path: "/home/yangl/BeyondMimic/g1_ctrl/unitree_robots/g1/scene_29dof_rl.xml"
@@ -23,7 +23,7 @@ urdf_path: "/home/blake/gen_mimic/source/whole_body_tracking/whole_body_tracking
 simulation_duration: 50.0
 # Simulation time step
 simulation_dt: 0.002
-# Controller update frequency (meets the requirement of simulation_dt * controll_decimation=0.02; 50Hz)
+# Controller update frequency (meets the requirement of simulation_dt * control_decimation=0.02; 50Hz)
 control_decimation: 10
 control_dt: 0.02
 cmd_scale: [1.0, 1.0, 1.0]
