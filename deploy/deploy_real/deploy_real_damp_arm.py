@@ -282,10 +282,6 @@ class Controller(Node):
             self.cmd = self.cmd_init.copy()
         self.counter = 0
 
-        if self.use_height_map:
-            self.height_map_obs = np.ones(self.N_grid_points, dtype=np.float32) * 0.0
-            self.height_map_obs = self.height_map_obs.view(self.grid_points_y, self.grid_points_x)
-
         if self.msg_type == "hg":
             # g1 and h1_2 use the hg msg type
             self.low_cmd = unitree_hg_msg_dds__LowCmd_()
@@ -587,7 +583,7 @@ class Controller(Node):
         
         # Identify wrist and waist joint indices in ONNX order to zero out
         self.zero_joint_indices = []
-        zero_joint_patterns = ['waist_roll', 'waist_pitch']
+        zero_joint_patterns = []
         self.gain_add_indicies = []
         gain_add_patterns = []
         for i, name in enumerate(self.joint_names):
@@ -1238,21 +1234,6 @@ class Controller(Node):
             f"Received filtered cmd: [{self.filtered_cmd[0]:.3f}, {self.filtered_cmd[1]:.3f},"
             f" {self.filtered_cmd[2]:.3f}]"
         )
-
-    def height_map_callback(self, msg: GridCells):
-        """Callback for height map information"""
-        if self.use_height_map:
-            # Find the average cell.z
-            heightmap_mean_z = np.mean([cell.z for cell in msg.cells])
-            for i, cell in enumerate(msg.cells):
-                x = round(cell.x / self.resolution) + self.grid_points_x // 2
-                y = round(cell.y / self.resolution) + self.grid_points_y // 2
-                if 0 <= x < self.grid_points_x and 0 <= y < self.grid_points_y:
-                    self.height_map_obs[y, x] = -(cell.z - heightmap_mean_z)
-
-            # print("Received height map with shape:", self.height_map_obs.shape)
-        else:
-            print("Height map callback called but height map is not enabled in config.")
 
     def _spin_ros(self):
         """Spin ROS2 in a separate thread to ensure callbacks are processed"""

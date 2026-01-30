@@ -1,5 +1,3 @@
-# Copyright (c) 2025 Blake Werner, Lizhi Yang AMBER LAB
-
 import argparse
 import os
 

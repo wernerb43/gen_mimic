@@ -1,5 +1,3 @@
-# Copyright (c) 2025 Lizhi Yang AMBER LAB
-
 import argparse
 import os
 import threading
@@ -30,7 +28,7 @@ from typing import List, Optional, Tuple
 
 
 class RLPolicyNode(Node):
-    def __init__(self, config_file="g1_21dof.yaml"):
+    def __init__(self, config_file="g1_29dof.yaml"):
         super().__init__("rl_policy_node")
         self.config_file = config_file
         self.sensor_sub = self.create_subscription(

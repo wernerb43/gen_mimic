@@ -1,10 +1,7 @@
-# Copyright (c) 2025 Lizhi Yang AMBER LAB
-
 import argparse
 import os
 import subprocess
 import sys
-
 import yaml
 
 
@@ -14,7 +11,7 @@ def main():
         "--config",
         type=str,
         required=True,
-        help="Config file name (e.g., g1_21dof.yaml)",
+        help="Config file name (e.g., g1_29dof.yaml)",
     )
     parser.add_argument(
         "--dof",
