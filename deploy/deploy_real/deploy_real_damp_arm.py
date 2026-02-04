@@ -1,4 +1,4 @@
-# Copyright (c) 2025 Lizhi Yang AMBER LAB
+# Copyright (c) 2025 Blake Werner, Lizhi Yang AMBER LAB
 
 import atexit
 import os
@@ -9,6 +9,10 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 from enum import Enum
+import sys
+import termios
+import tty
+import select
 import yaml
 import onnx
 import json
@@ -117,13 +121,6 @@ class G1JointIndex:
 
 
 def load_robot_description_text(urdf_path: str) -> str:
-    """Return full URDF XML text. If the path ends with .xacro and xacro is installed, expand it."""
-    # if urdf_path.endswith(".xacro"):
-    #     try:
-    #         import xacro
-    #         return xacro.process_file(urdf_path).toxml()
-    #     except Exception as e:
-    #         print(f"Warning: xacro expansion failed for {urdf_path}: {e}. Trying to read as XML file.")
     with open(urdf_path) as f:
         return f.read()
 
@@ -173,73 +170,6 @@ class Controller(Node):
         except Exception as e:
             self.get_logger().error(f"Failed to start robot_state_publisher: {e}")
 
-        # --- Publish a static world -> base frame (optional, helps RViz Fixed Frame) ---
-        base_frame = "base_link"
-        # world_frame = getattr(self.config, "world_frame", "world")
-        self.static_broadcaster = tf2_ros.StaticTransformBroadcaster(self)
-        t = TransformStamped()
-        t.header.stamp = self.get_clock().now().to_msg()
-        t.header.frame_id = "world"
-        t.child_frame_id = "base_link"
-        t.transform.translation.x = 0.0
-        t.transform.translation.y = 0.0
-        t.transform.translation.z = 0.0
-        t.transform.rotation.x = 0.0
-        t.transform.rotation.y = 0.0
-        t.transform.rotation.z = 0.0
-        t.transform.rotation.w = 1.0
-        self.static_broadcaster.sendTransform(t)
-        t1 = TransformStamped()
-        t1.header.stamp = self.get_clock().now().to_msg()
-        t1.header.frame_id = base_frame
-        t1.child_frame_id = "pelvis_link"
-        t1.transform.translation.x = 0.0
-        t1.transform.translation.y = 0.0
-        t1.transform.translation.z = 0.0
-        t1.transform.rotation.x = 0.0
-        t1.transform.rotation.y = 0.0
-        t1.transform.rotation.z = 0.0
-        t1.transform.rotation.w = 1.0
-        self.static_broadcaster.sendTransform(t1)
-        t2 = TransformStamped()
-        t2.header.stamp = self.get_clock().now().to_msg()
-        t2.header.frame_id = "map"
-        t2.child_frame_id = "world"
-        t2.transform.translation.x = 0.0
-        t2.transform.translation.y = 0.0
-        t2.transform.translation.z = 0.0
-        t2.transform.rotation.x = 0.0
-        t2.transform.rotation.y = 0.0
-        t2.transform.rotation.z = 0.0
-        t2.transform.rotation.w = 1.0
-        self.static_broadcaster.sendTransform(t2)
-
-        # ROS2 publishers and subscribers
-        self.cmd_vel_publisher = self.create_publisher(Twist, "/cmd_vel_raw", 10)
-        self.cmd_vel_subscriber = self.create_subscription(
-            Twist, "/cmd_vel_filtered", self.cmd_vel_filtered_callback, 10
-        )
-        if self.use_height_map:
-            self.height_map_subscriber = self.create_subscription(
-                GridCells, self.height_map_topic, self.height_map_callback, 10
-            )
-        
-        # Teleoperation Subscribers
-        self.create_subscription(Float32MultiArray, 'xr/left_thumbstick_value', self.teleop_vel_callback, 10)
-        self.create_subscription(Float32MultiArray, 'xr/right_thumbstick_value', self.teleop_yaw_callback, 10)
-        
-        self.create_subscription(Bool, 'xr/right_aButton', self.teleop_right_a_callback, 10)
-        self.create_subscription(Bool, 'xr/right_bButton', self.teleop_right_b_callback, 10)
-        self.create_subscription(Bool, 'xr/left_aButton', self.teleop_left_a_callback, 10)
-        self.create_subscription(Bool, 'xr/left_bButton', self.teleop_left_b_callback, 10)
-        
-        self.create_subscription(Float32, 'xr/left_squeeze_ctrl_value', self.teleop_left_squeeze_callback, 10)
-        self.create_subscription(Float32, 'xr/right_squeeze_ctrl_value', self.teleop_right_squeeze_callback, 10)
-
-        # Store filtered velocity for history updates
-        self.filtered_cmd = np.zeros(3, dtype=np.float32)
-        self.filtered_cmd_received = False  # Flag to track if we've received filtered commands
-
         # Start ROS2 spinning in a separate thread
         self.ros_thread = threading.Thread(target=self._spin_ros, daemon=True)
         self.ros_running = True
@@ -261,32 +191,28 @@ class Controller(Node):
         self.current_state = ControllerState.ZERO_TORQUE
         
         # Teleop State Flags
-        self.teleop_cmd_vel = np.zeros(3) # vx, vy, vyaw
-        self.teleop_height_cmd = 0.0 # delta height
-        self.teleop_buttons = {
-            'left_a': False, 'left_b': False, 
-            'right_a': False, 'right_b': False,
-            'left_squeeze': 0.0, 'right_squeeze': 0.0
-        }
-        self.prev_teleop_buttons = self.teleop_buttons.copy()
+        self._kb_request_state = None
+        self._exit_requested = False
+        self._term_settings = None
+        self._keyboard_thread = threading.Thread(target=self._keyboard_loop, daemon=True)
+
+        # Initial yaw offset for IMU drift compensation
+        self._initial_yaw = None
+
+        # Motion playback control (policy mode)
+        self._play_motion_once = False
 
         # --- State variables for observation ---
         self.qj = np.zeros(self.num_joints, dtype=np.float32)
         self.dqj = np.zeros(self.num_joints, dtype=np.float32)
         self.omega = np.zeros(3, dtype=np.float32)
         self.action = np.zeros(self.num_joints, dtype=np.float32)
-        # Initialize command (vx, vy, vyaw, height)
-        if len(self.cmd_init) == 3:
-            self.cmd = np.concatenate([self.cmd_init.copy(), np.array([0.75], dtype=np.float32)])
-        else:
-            self.cmd = self.cmd_init.copy()
         self.counter = 0
 
         if self.msg_type == "hg":
             # g1 and h1_2 use the hg msg type
             self.low_cmd = unitree_hg_msg_dds__LowCmd_()
             self.low_state = unitree_hg_msg_dds__LowState_()
-            self.odom_state = unitree_go_msg_dds__SportModeState_()
             self.mode_pr_ = MotorMode.PR
             self.mode_machine_ = 5  # TODO might be 1 on new firmware?
 
@@ -296,10 +222,6 @@ class Controller(Node):
             self.lowstate_subscriber = ChannelSubscriber(self.lowstate_topic, LowStateHG)
             self.lowstate_subscriber.Init(self.LowStateHgHandler, 10)
 
-            # self.odom_subscriber = ChannelSubscriber("rt/lf/odommodestate", SportModeState_)
-            # self.odom_subscriber.Init(self.OdomStateHandler, 10)
-
-            self.odom_pose = np.zeros(3, dtype=np.float32)
             self.init_odom_flag = True
 
         elif self.msg_type == "go":
@@ -336,6 +258,8 @@ class Controller(Node):
         
         # Start ROS2 spinning now that everything is initialized
         self.ros_thread.start()
+        # Start keyboard listener
+        self._keyboard_thread.start()
 
     def load_config(self):
         G1_RL_ROOT_DIR = os.getenv("G1_RL_ROOT_DIR")
@@ -343,17 +267,9 @@ class Controller(Node):
             config = yaml.load(f, Loader=yaml.FullLoader)
         self.policy_path = config["policy_path"].replace("{G1_RL_ROOT_DIR}", G1_RL_ROOT_DIR)
         self.use_gpu = config.get("use_gpu", False)
-        self.use_height_map = config.get("use_height_map", False)
+        # self.use_height_map = config.get("use_height_map", False)
         self.xml_path = config.get("xml_path", "").replace("{G1_RL_ROOT_DIR}", G1_RL_ROOT_DIR)
         self.robot_xml_path = config.get("robot_xml_path", self.xml_path).replace("{G1_RL_ROOT_DIR}", G1_RL_ROOT_DIR)
-        self.grid_size_x = float(config.get("grid_size_x", 1.0))
-        self.grid_size_y = float(config.get("grid_size_y", 1.0))
-        self.resolution = float(config.get("resolution", 0.1))
-        self.forward_offset = float(config.get("forward_offset", 0.0))
-        self.grid_points_x = int(config.get("grid_points_x", 1))
-        self.grid_points_y = int(config.get("grid_points_y", 1))
-        self.N_grid_points = int(config.get("N_grid_points", self.grid_points_x * self.grid_points_y))
-        self.height_offset = float(config.get("height_offset", 0.5))
         self.simulation_dt = float(config.get("simulation_dt", 0.002))
         self.control_decimation = int(config.get("control_decimation", 10))
         self.control_dt = float(config.get("control_dt", self.simulation_dt * self.control_decimation))
@@ -540,9 +456,12 @@ class Controller(Node):
             self.p_gain = np.array(joint_stiffness, dtype=np.float32)
             self.d_gain = np.array(joint_damping, dtype=np.float32)
             self.p_gain_mujoco = self.isaac_to_mujoco(self.p_gain)
-            print("p_gain_mujoco:", self.p_gain_mujoco)
             self.d_gain_mujoco = self.isaac_to_mujoco(self.d_gain)
-            print("d_gain_mujoco:", self.d_gain_mujoco)
+                # Add 10 to the first 12 gains
+            # self.p_gain_mujoco[:12] += 10.0
+            print("p_gains (mujoco order, loaded from metadata):", self.p_gain_mujoco)
+            self.d_gain_mujoco = self.isaac_to_mujoco(self.d_gain)
+            print("d_gains (mujoco order, loaded from metadata):", self.d_gain_mujoco)
         except Exception as e:
             raise RuntimeError(
                 f"Failed to convert joint_stiffness/damping from metadata to numpy array: {e}"
@@ -584,15 +503,15 @@ class Controller(Node):
         # Identify wrist and waist joint indices in ONNX order to zero out
         self.zero_joint_indices = []
         zero_joint_patterns = []
-        self.gain_add_indicies = []
+        self.gain_add_indices = []
         gain_add_patterns = []
         for i, name in enumerate(self.joint_names):
             if any(pattern in name for pattern in zero_joint_patterns):
                 self.zero_joint_indices.append(i)
             if any(pattern in name for pattern in gain_add_patterns):
-                self.gain_add_indicies.append(i)
+                self.gain_add_indices.append(i)
         print(f"Zero joint indices (ONNX order): {self.zero_joint_indices}")
-        print(f"Gain add indices (ONNX order): {self.gain_add_indicies}")
+        print(f"Gain add indices (ONNX order): {self.gain_add_indices}")
         
         # Map zero joint indices to MuJoCo/hardware indices for motor disabling
         self.zero_motor_indices = []
@@ -602,32 +521,12 @@ class Controller(Node):
             mujoco_idx = self.isaac_to_mujoco_joint_indices[idx]
             if mujoco_idx >= 0:
                 self.zero_motor_indices.append(mujoco_idx)
-        for idx in self.gain_add_indicies:
+        for idx in self.gain_add_indices:
             mujoco_idx = self.isaac_to_mujoco_joint_indices[idx]
             if mujoco_idx >= 0:
                 self.gain_add_motor_indices.append(mujoco_idx)
         print(f"Zero motor indices (MuJoCo/hardware order): {self.zero_motor_indices}")
         print(f"Gain add motor indices (MuJoCo/hardware order): {self.gain_add_motor_indices}")
-
-        self.free_joint_indices = []
-        free_joint_patterns = []
-        for i, name in enumerate(self.joint_names):
-            if any(pattern in name for pattern in free_joint_patterns):
-                self.free_joint_indices.append(i)
-        print(f"Free joint indices (ONNX order): {self.free_joint_indices}")
-
-        self.free_motor_indices = []
-        for idx in self.free_joint_indices:
-            mujoco_idx = self.isaac_to_mujoco_joint_indices[idx]
-            if mujoco_idx >= 0:
-                self.free_motor_indices.append(mujoco_idx)
-        print(f"Free motor indices (MuJoCo/hardware order): {self.free_motor_indices}")
-        
-        print(f"mujoco joint names: {self.joint_names_mujoco}")
-        print(f"p_gain: {self.isaac_to_mujoco(self.p_gain)}")
-        print(f"d_gain: {self.isaac_to_mujoco(self.d_gain)}")
-        print(f"observation names:", self.observation_names)
-        print(f"command names:", self.command_names)
 
     def _stop_rsp(self):
         try:
@@ -655,10 +554,6 @@ class Controller(Node):
         self.low_state = msg
         # self.remote_controller.set(self.low_state.wireless_remote)
 
-    def OdomStateHandler(self, msg: SportModeState_):
-        self.odom_state = msg
-        # print("position: ", self.odom_state.position[0]-self.odom_pose[0], self.odom_state.position[1]-self.odom_pose[1], self.odom_state.position[2]-self.odom_pose[2])
-
     def send_cmd(self, cmd: LowCmdGo | LowCmdHG):
         cmd.crc = CRC().Crc(cmd)
         self.lowcmd_publisher_.Write(cmd)
@@ -670,7 +565,7 @@ class Controller(Node):
 
     def zero_torque_state(self):
         print("Enter zero torque state.")
-        print("Waiting for both controllers to be squeezed...")
+        print("Press 'd' for damping, 'x' for default pose, 'p' for policy, 'q' to quit.")
         while self.current_state == ControllerState.ZERO_TORQUE:
             create_zero_cmd(self.low_cmd)
             self.send_cmd(self.low_cmd)
@@ -679,7 +574,7 @@ class Controller(Node):
 
     def damping_state(self):
         print("Enter damping state.")
-        print("Press X to go to default pose")
+        print("Press 'x' for default pose, 'p' for policy, 'q' to quit.")
         while self.current_state == ControllerState.DAMPING:
             create_damping_cmd(self.low_cmd)
             self.send_cmd(self.low_cmd)
@@ -688,7 +583,7 @@ class Controller(Node):
 
     def default_pos_state(self):
         print("Enter default pos state.")
-        print("Press Y to go to policy mode")
+        print("Press 'p' to go to policy mode, 'd' for damping, 'q' to quit.")
 
         # Move to default position first
         self.move_to_default_pos()
@@ -721,7 +616,7 @@ class Controller(Node):
     def policy_state(self):
         print("Enter policy state.")
         print(
-            "Squeeze both controllers to go to damping, left joystick to control linear velocity, right joystick to control angular velocity, right A/B to control height."
+            "Keyboard controls: x for default pose, d for damping, q to quit."
         )
         while self.current_state == ControllerState.POLICY:
             self.run()
@@ -730,57 +625,19 @@ class Controller(Node):
             self.policy_mode_listener()
             self.update_state_machine()
 
-    def check_button_press(self, button_name):
-        """Check if a button was just pressed (transition from False to True)"""
-        current = self.teleop_buttons[button_name]
-        prev = self.prev_teleop_buttons[button_name]
-        return not prev and current
-
     def update_state_machine(self):
         """Update the state machine based on button presses"""
-        
-        # Debug prints (throttled?)
-        # print(f"State: {self.current_state}, Buttons: {self.teleop_buttons}")
-
-        # Check squeeze for Damping (both pressed > 0.5)
-        if self.teleop_buttons['left_squeeze'] > 0.5 and self.teleop_buttons['right_squeeze'] > 0.5:
-            if self.current_state != ControllerState.DAMPING:
-                print("Transitioning to DAMPING state (Squeeze)")
-                self.current_state = ControllerState.DAMPING
-            # If we are holding squeeze, we force DAMPING. 
-            # To switch out, user must release squeeze.
-            # We return here to enforce this priority.
-            self._update_prev_buttons()
-            return
-
-        # State-specific transitions
-        if self.current_state == ControllerState.ZERO_TORQUE:
-            # Transition to Damping if triggers pressed (handled above)
-            pass
-
-        elif self.current_state == ControllerState.DAMPING:
-            # X (Left A) -> Default Pose (Ready)
-            if self.check_button_press('left_a'):
-                print("Transitioning to DEFAULT_POSE state (X)")
-                self.current_state = ControllerState.DEFAULT_POSE
-
-        elif self.current_state == ControllerState.DEFAULT_POSE:
-            # Y (Left B) -> Policy
-            if self.check_button_press('left_b'):
-                print("Transitioning to POLICY state (Y)")
-                self.current_state = ControllerState.POLICY
-            # Triggers -> Damping (handled above)
-
-        elif self.current_state == ControllerState.POLICY:
-            # Triggers -> Damping (handled above)
-            pass
-            
-        self._update_prev_buttons()
-
-    def _update_prev_buttons(self):
-        """Update previous button states"""
-        for k, v in self.teleop_buttons.items():
-            self.prev_teleop_buttons[k] = v
+        if self._kb_request_state is not None:
+            requested = self._kb_request_state
+            self._kb_request_state = None
+            if requested != self.current_state:
+                print(f"Transitioning to {requested.name} state (keyboard)")
+                if requested == ControllerState.POLICY:
+                    # On first entry to policy, hold the first frame
+                    if self.motion_trajectory is not None:
+                        self.motion_frame_idx = 0
+                    self._play_motion_once = False
+            self.current_state = requested
 
     def policy_mode_listener(self):
         # Listen for remote button presses to switch policy mode
@@ -829,90 +686,8 @@ class Controller(Node):
             self.send_cmd(self.low_cmd)
             time.sleep(self.control_dt)
 
-    def update_history_buffers(
-        self,
-        omega,
-        gravity_orientation,
-        cmd,
-        qj_isaac,
-        dqj_isaac,
-        action,
-        phase,
-        obstacle_obs=None,
-    ):
-        """Update history buffers by shifting old data and adding new observations"""
-        # Shift existing data (move older entries forward, newest at the end)
-        if self.history_length > 1:
-            self.omega_history[:-1] = self.omega_history[1:].clone()
-            self.gravity_orientation_history[:-1] = self.gravity_orientation_history[1:].clone()
-            self.cmd_history[:-1] = self.cmd_history[1:].clone()
-            self.qj_isaac_history[:-1] = self.qj_isaac_history[1:].clone()
-            self.dqj_isaac_history[:-1] = self.dqj_isaac_history[1:].clone()
-            self.action_history[:-1] = self.action_history[1:].clone()
-            self.phase_history[:-1] = self.phase_history[1:].clone()
-            # if self.obstacle_observation:
-            self.obstacle_history[:-1] = self.obstacle_history[1:].clone()
-
-        # Add new observations at the end (newest)
-        self.omega_history[-1] = omega
-        self.gravity_orientation_history[-1] = gravity_orientation
-        # Always store 4-dim cmd (pad if needed)
-        # cmd_pad = torch.zeros(self.max_cmd_dim, dtype=cmd.dtype, device=cmd.device)
-        # cmd_pad[: cmd.shape[0]] = cmd
-        self.cmd_history[-1] = cmd
-        self.qj_isaac_history[-1] = qj_isaac
-        self.dqj_isaac_history[-1] = dqj_isaac
-        self.action_history[-1] = action
-        self.phase_history[-1] = phase
-        # if (
-        #     getattr(self, "obstacle_history", None) is not None
-        #     and obstacle_obs is not None
-        # ):
-        self.obstacle_history[-1] = obstacle_obs
-
     def run(self):
         start_time = time.time()
-        if self.init_odom_flag:
-            self.init_odom_flag = False
-            self.odom_pose[0] = self.odom_state.position[0]
-            self.odom_pose[1] = self.odom_state.position[1]
-            self.odom_pose[2] = self.odom_state.position[2]
-        # Get the current joint position and velocity
-        # Get the current joint position and velocity
-        self.cmd[0] = self.teleop_cmd_vel[0] # vx
-        self.cmd[1] = self.teleop_cmd_vel[1] # vy
-        self.cmd[2] = self.teleop_cmd_vel[2] # vyaw
-        
-        # Height control (Right A/B)
-        if self.teleop_buttons['right_b']: # Up
-             self.cmd[3] = min(0.75, self.cmd[3] + 0.002)
-        elif self.teleop_buttons['right_a']: # Down
-             self.cmd[3] = max(0.4, self.cmd[3] - 0.002)
-
-        # Publish raw velocity command to ROS2
-        max_cmd = self.max_cmd.copy()  
-        raw_cmd_scaled = self.cmd[:3] * max_cmd
-        cmd_vel_msg = Twist()
-        cmd_vel_msg.linear.x = float(raw_cmd_scaled[0])
-        cmd_vel_msg.linear.y = float(raw_cmd_scaled[1])
-        cmd_vel_msg.angular.z = float(raw_cmd_scaled[2])
-        self.cmd_vel_publisher.publish(cmd_vel_msg)
-
-        # Use filtered velocity if available, otherwise fall back to raw command
-        if self.filtered_cmd_received:
-            self.cmd[:3] = self.filtered_cmd.copy()
-
-        #TODO implement history buffer
-        # self.update_history_buffers(
-        #     omega_tensor,
-        #     gravity_orientation_tensor,
-        #     cmd_for_history,
-        #     qj_isaac_tensor,
-        #     dqj_isaac_tensor,
-        #     self.action_tensor,
-        #     phase_tensor,
-        #     self.obstacle_info,
-        # )
 
         # Run the policy network
         out0 = self._run_onnx_inference()
@@ -951,10 +726,16 @@ class Controller(Node):
             # send the command
             self.send_cmd(self.low_cmd)
             
-            # Increment motion frame index (if trajectory is loaded)
-            if self.motion_trajectory is not None:
+            # Increment motion frame index only when playing once
+            if self.motion_trajectory is not None and self._play_motion_once:
                 num_frames = self.motion_trajectory["joint_pos"].shape[0]
-                self.motion_frame_idx = (self.motion_frame_idx + 1) % num_frames
+                if num_frames > 0:
+                    if self.motion_frame_idx < num_frames - 1:
+                        self.motion_frame_idx += 1
+                    else:
+                        # Reached end: reset to first frame and stop playback
+                        self.motion_frame_idx = 0
+                        self._play_motion_once = False
             
             time.sleep(self.control_dt)
 
@@ -1027,7 +808,7 @@ class Controller(Node):
         # This is: motion_anchor_pos_w - robot_anchor_pos_w, transformed to robot base frame
         if self.motion_trajectory is not None:
             try:
-                # Anchor body is typically the first body (index 0, pelvis/base)
+                    # Anchor body is typically the first body (index 0, pelvis/base)
                 motion_anchor_pos = self.motion_trajectory["body_pos_w"][self.motion_frame_idx, 0]  # (3,)
                 
                 # Robot anchor position from low state (base position)
@@ -1059,35 +840,40 @@ class Controller(Node):
         # Return motion anchor body orientation error in robot base frame as 6D encoding
         # Format: [r00, r01, r10, r11, r20, r21] - first two columns of 3x3 rotation matrix
         if self.motion_trajectory is not None:
-            try:
+            # try:
                 # Get motion anchor orientation (first body, pelvis/base)
-                motion_anchor_quat = self.motion_trajectory["body_quat_w"][self.motion_frame_idx, 0]  # (4,) wxyz
-                
-                # Robot anchor orientation from IMU
-                robot_anchor_quat = np.array([
-                    self.low_state.imu_state.quaternion[0],
-                    self.low_state.imu_state.quaternion[1],
-                    self.low_state.imu_state.quaternion[2],
-                    self.low_state.imu_state.quaternion[3]
-                ], dtype=np.float32)
-                
-                # Compute relative quaternion: quat_error = quat_robot_inv * quat_motion
-                q_inv = self._quat_conjugate(robot_anchor_quat)
-                q_rel = self._quat_multiply(q_inv, motion_anchor_quat)
-                
-                # Convert quaternion to rotation matrix
-                rot_mat = self._quat_to_rotation_matrix(q_rel)
-                
-                # Extract 6D encoding: [r00, r01, r10, r11, r20, r21]
-                ori_6d = np.array([
-                    rot_mat[0, 0], rot_mat[0, 1],
-                    rot_mat[1, 0], rot_mat[1, 1],
-                    rot_mat[2, 0], rot_mat[2, 1]
-                ], dtype=np.float32)
-                
-                return ori_6d
-            except Exception as e:
-                self.get_logger().warn(f"Error computing motion anchor orientation: {e}")
+            motion_anchor_quat = self.motion_trajectory["body_quat_w"][self.motion_frame_idx, 0]  # (4,) wxyz
+            
+            # Robot anchor orientation from IMU
+            robot_anchor_quat = np.array([
+                self.low_state.imu_state.quaternion[0],
+                self.low_state.imu_state.quaternion[1],
+                self.low_state.imu_state.quaternion[2],
+                self.low_state.imu_state.quaternion[3]
+            ], dtype=np.float32)
+
+            # Capture initial yaw offset once and remove it from subsequent measurements
+            if self._initial_yaw is None:
+                self._initial_yaw = self._quat_to_yaw(robot_anchor_quat)
+            yaw_correction = self._yaw_to_quat(-self._initial_yaw)
+            robot_anchor_quat = self._quat_multiply(yaw_correction, robot_anchor_quat)
+            
+            # Compute relative quaternion: quat_error = quat_robot_inv * quat_motion
+            q_inv = self._quat_conjugate(robot_anchor_quat)
+            q_rel = self._quat_multiply(q_inv, motion_anchor_quat)
+            
+            # Convert quaternion to rotation matrix
+            rot_mat = self._quat_to_rotation_matrix(q_rel)
+            
+            # Extract 6D encoding: [r00, r01, r10, r11, r20, r21]
+            ori_6d = np.array([
+                rot_mat[0, 0], rot_mat[0, 1],
+                rot_mat[1, 0], rot_mat[1, 1],
+                rot_mat[2, 0], rot_mat[2, 1]
+            ], dtype=np.float32)
+            return ori_6d
+            # except Exception as e:
+            #     self.get_logger().warn(f"Error computing motion anchor orientation: {e}")
         return np.zeros(6, dtype=np.float32)
 
     def _quat_conjugate(self, q: np.ndarray) -> np.ndarray:
@@ -1121,6 +907,18 @@ class Controller(Node):
             [2*(x*y + w*z), 1 - 2*(x*x + z*z), 2*(y*z - w*x)],
             [2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x*x + y*y)]
         ], dtype=np.float32)
+
+    def _quat_to_yaw(self, q: np.ndarray) -> float:
+        """Extract yaw (rotation about z) from quaternion. q format: [w, x, y, z]."""
+        w, x, y, z = q
+        siny_cosp = 2.0 * (w * z + x * y)
+        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+        return float(np.arctan2(siny_cosp, cosy_cosp))
+
+    def _yaw_to_quat(self, yaw: float) -> np.ndarray:
+        """Create a yaw-only quaternion. Output format: [w, x, y, z]."""
+        half = 0.5 * yaw
+        return np.array([np.cos(half), 0.0, 0.0, np.sin(half)], dtype=np.float32)
 
     def obs_projected_gravity(self):
         quat = self.low_state.imu_state.quaternion
@@ -1192,6 +990,7 @@ class Controller(Node):
             if obs_val is None:
                 raise RuntimeError(f"Observation function '{func_name}' returned None.")
             obs_list.append(np.asarray(obs_val, dtype=np.float32))
+        print(obs_list)
         return np.concatenate(obs_list, axis=-1)
 
     def _run_onnx_inference(self):
@@ -1224,17 +1023,6 @@ class Controller(Node):
         outputs = self.onnx_sess.run(None, input_feed)
         return outputs[0]
 
-    def cmd_vel_filtered_callback(self, msg: Twist):
-        """Callback for filtered velocity commands"""
-        self.filtered_cmd[0] = msg.linear.x  # forward/backward
-        self.filtered_cmd[1] = msg.linear.y  # left/right
-        self.filtered_cmd[2] = msg.angular.z  # rotation
-        self.filtered_cmd_received = True
-        print(
-            f"Received filtered cmd: [{self.filtered_cmd[0]:.3f}, {self.filtered_cmd[1]:.3f},"
-            f" {self.filtered_cmd[2]:.3f}]"
-        )
-
     def _spin_ros(self):
         """Spin ROS2 in a separate thread to ensure callbacks are processed"""
         while self.ros_running:
@@ -1244,40 +1032,36 @@ class Controller(Node):
                 print(f"ROS2 spinning error: {e}")
                 time.sleep(0.01)
 
-            except Exception as e:
-                print(f"ROS2 spinning error: {e}")
-                time.sleep(0.01)
+    def _keyboard_loop(self):
+        try:
+            self._term_settings = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin.fileno())
+            while self.ros_running and not self._exit_requested:
+                rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if rlist:
+                    ch = sys.stdin.read(1)
+                    self._handle_keypress(ch)
+        finally:
+            if self._term_settings is not None:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._term_settings)
 
-    def teleop_vel_callback(self, msg):
-        # Left Joystick: msg.data is [x, y]
-        if len(msg.data) >= 2:
-            # y is forward/backward (vx), x is left/right (vy)
-            self.teleop_cmd_vel[0] = -msg.data[1] * 1.0 # vx
-            self.teleop_cmd_vel[1] = -msg.data[0] * 1.0 # vy
-            
-    def teleop_yaw_callback(self, msg):
-        # Right Joystick: msg.data is [x, y]
-        if len(msg.data) >= 2:
-            # x is left/right (vyaw)
-            self.teleop_cmd_vel[2] = -msg.data[0] * 1.0 # vyaw
-
-    def teleop_right_a_callback(self, msg):
-        self.teleop_buttons['right_a'] = msg.data
-
-    def teleop_right_b_callback(self, msg):
-        self.teleop_buttons['right_b'] = msg.data
-
-    def teleop_left_a_callback(self, msg):
-        self.teleop_buttons['left_a'] = msg.data
-
-    def teleop_left_b_callback(self, msg):
-        self.teleop_buttons['left_b'] = msg.data
-        
-    def teleop_left_squeeze_callback(self, msg):
-        self.teleop_buttons['left_squeeze'] = msg.data
-        
-    def teleop_right_squeeze_callback(self, msg):
-        self.teleop_buttons['right_squeeze'] = msg.data
+    def _handle_keypress(self, ch: str):
+        key = ch.lower()
+        if key == "q":
+            self._exit_requested = True
+            return
+        if key == "z":
+            self._kb_request_state = ControllerState.ZERO_TORQUE
+        elif key == "d":
+            self._kb_request_state = ControllerState.DAMPING
+        elif key == "x":
+            self._kb_request_state = ControllerState.DEFAULT_POSE
+        elif key == "p":
+            if self.current_state == ControllerState.POLICY:
+                # While in policy mode, play motion once from current frame
+                self._play_motion_once = True
+            else:
+                self._kb_request_state = ControllerState.POLICY
             
     def main_loop(self):
         """Main control loop that runs the state machine"""
@@ -1289,6 +1073,9 @@ class Controller(Node):
 
         try:
             while True:
+                
+                if self._exit_requested:
+                    break
                 if self.current_state == ControllerState.ZERO_TORQUE:
                     self.zero_torque_state()
                 elif self.current_state == ControllerState.DAMPING:

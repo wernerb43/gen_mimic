@@ -1,10 +1,9 @@
-policy_path: "/home/blake/gen_mimic/logs/rsl_rl/2026-01-28_18-02-38_throw_5_talos.onnx"
+policy_path: "/home/blake/gen_mimic/logs/rsl_rl/g1_flat/2026-02-03_13-32-30_throw_no_waist_1/2026-02-03_13-32-30_throw_no_waist_1.onnx"
 use_gpu: True
 plot_feet: False
 
 # Motion trajectory file (npz format from csv_to_npz.py)
-motion_npz_path: "/home/blake/gen_mimic/artifacts/throw_5:v0/motion.npz"
-
+motion_npz_path: "/home/blake/gen_mimic/artifacts/throw_no_waist_1:v0/motion.npz"
 xml_path: "/home/blake/gen_mimic/g1/scene_29dof_rl.xml"
 robot_xml_path: "/home/blake/gen_mimic/g1/g1_29dof_rl.xml"
 urdf_path: "/home/blake/gen_mimic/source/whole_body_tracking/whole_body_tracking/assets/unitree_description/urdf/g1/main.urdf"

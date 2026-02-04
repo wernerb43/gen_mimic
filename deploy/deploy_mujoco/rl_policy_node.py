@@ -25,6 +25,7 @@ import xml.etree.ElementTree as ET
 
 # add typing imports for explicit annotation to avoid List[None] inference
 from typing import List, Optional, Tuple
+import threading
 
 
 class RLPolicyNode(Node):
@@ -83,6 +84,16 @@ class RLPolicyNode(Node):
         # whether policy stepping has actually started (for one-time print)
         self._policy_started = False
         # Track last cache frame per velocity index to detect wraps
+        
+        # Motion playback control (policy mode)
+        self._play_motion_once = False
+        self._initial_yaw = None
+        
+        # Keyboard input handling for motion playback
+        self._kb_request_play = False
+        self._term_settings = None
+        self._keyboard_thread = threading.Thread(target=self._keyboard_loop, daemon=True)
+        self._keyboard_thread.start()
 
     def load_config(self):
         G1_RL_ROOT_DIR = os.getenv("G1_RL_ROOT_DIR")
@@ -237,6 +248,7 @@ class RLPolicyNode(Node):
         self.dqj_shape = (self.num_joints,)
 
         self.observation_names = parsed_meta.get("observation_names", [])
+        print('obs names', self.observation_names)
         self.command_names = parsed_meta.get("command_names", [])
 
         # --- Parse joint order from XML and create mapping to ONNX metadata joint order ---
@@ -369,6 +381,7 @@ class RLPolicyNode(Node):
         """
         self.motion_trajectory = None
         self.motion_frame_idx = 0
+        self._play_motion_once = False
         
         if not self.motion_npz_path or self.motion_npz_path == "":
             self.get_logger().info("No motion trajectory file specified, using zero placeholders")
@@ -520,6 +533,18 @@ class RLPolicyNode(Node):
         if not getattr(self, '_policy_started', False):
             print(f"[RLPolicyNode] Policy stepping started at sim_time={getattr(self,'sim_time',-1):.3f}", flush=True)
             self._policy_started = True
+        
+        # Handle motion playback: increment frame only if playback active
+        if self.motion_trajectory is not None and self._play_motion_once:
+            num_frames = self.motion_trajectory["joint_pos"].shape[0]
+            if num_frames > 0:
+                if self.motion_frame_idx < num_frames - 1:
+                    self.motion_frame_idx += 1
+                else:
+                    # Reached end: reset to first frame and stop playback
+                    self.motion_frame_idx = 0
+                    self._play_motion_once = False
+        
         # Build velocity command and fetch nearest cached IK candidate
         # Run ONNX inference (the policy may reference obs_ik_* in its observation_names)
         if hasattr(self, "onnx_sess") and self.onnx_sess is not None:
@@ -548,12 +573,6 @@ class RLPolicyNode(Node):
                     ]
                 ).tolist()
                 self.action_pub.publish(msg)
-                
-                # Increment motion frame index (if trajectory is loaded)
-                if self.motion_trajectory is not None:
-                    num_frames = self.motion_trajectory["joint_pos"].shape[0]
-                    self.motion_frame_idx = (self.motion_frame_idx + 1) % num_frames
-                
                 return
             except Exception as e:
                 # ONNX inference failed; fall back to IK-first-frame or default
@@ -566,6 +585,32 @@ class RLPolicyNode(Node):
     # def pd_control(self, target_q, q, kp, target_dq, dq, kd):
     #     """Calculates torques from position commands"""
     #     return (target_q - q) * kp + (target_dq - dq) * kd
+
+    def _keyboard_loop(self):
+        """Keyboard input loop for motion playback control."""
+        try:
+            import select
+            import tty
+            import termios
+            
+            self._term_settings = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin.fileno())
+            while True:
+                rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if rlist:
+                    ch = sys.stdin.read(1)
+                    if ch.lower() == 'p':
+                        self._play_motion_once = True
+                    elif ch.lower() == 'q':
+                        break
+        except Exception as e:
+            self.get_logger().warn(f"Keyboard input error: {e}")
+        finally:
+            if self._term_settings is not None:
+                try:
+                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._term_settings)
+                except Exception:
+                    pass
 
     # Remove all pinocchio/cbf/obstacle xml parsing methods
 
@@ -642,24 +687,24 @@ class RLPolicyNode(Node):
         # Return motion anchor body position error in robot base frame
         # This is: motion_anchor_pos_w - robot_anchor_pos_w, transformed to robot base frame
         if self.motion_trajectory is not None:
-            try:
+            # try:
                 # Anchor body is typically the first body (index 0, pelvis/base)
-                motion_anchor_pos = self.motion_trajectory["body_pos_w"][self.motion_frame_idx, 0]  # (3,)
-                
-                # Robot anchor position is the robot's current position
-                robot_anchor_pos = self.robot_position  # (3,)
-                
-                # Position difference in world frame
-                pos_error_w = motion_anchor_pos - robot_anchor_pos
-                
-                # Transform to robot base frame using quaternion
-                # q_inv rotates from world to body frame
-                q_inv = self._quat_conjugate(self.quat)
-                pos_error_b = self._quat_rotate(q_inv, pos_error_w)
-                
-                return pos_error_b.astype(np.float32)
-            except Exception as e:
-                self.get_logger().warn(f"Error computing motion anchor position: {e}")
+            motion_anchor_pos = self.motion_trajectory["body_pos_w"][self.motion_frame_idx, 0]  # (3,)
+            
+            # Robot anchor position is the robot's current position
+            robot_anchor_pos = self.robot_position  # (3,)
+            
+            # Position difference in world frame
+            pos_error_w = motion_anchor_pos - robot_anchor_pos
+            
+            # Transform to robot base frame using quaternion
+            # q_inv rotates from world to body frame
+            q_inv = self._quat_conjugate(self.quat)
+            pos_error_b = self._quat_rotate(q_inv, pos_error_w)
+            
+            return pos_error_b.astype(np.float32)
+            # except Exception as e:
+            #     self.get_logger().warn(f"Error computing motion anchor position: {e}")
         return np.zeros(3, dtype=np.float32)
 
     def obs_motion_anchor_ori_b(self):
@@ -763,6 +808,35 @@ class RLPolicyNode(Node):
 
         return gravity_orientation
 
+    def _keyboard_loop(self):
+        """Keyboard input loop for motion playback control."""
+        try:
+            import sys
+            import select
+            import tty
+            import termios
+            
+            self._term_settings = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin.fileno())
+            while True:
+                rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if rlist:
+                    ch = sys.stdin.read(1)
+                    if ch.lower() == 'p':
+                        self._play_motion_once = True
+                    elif ch.lower() == 'q':
+                        break
+        except Exception as e:
+            self.get_logger().warn(f"Keyboard input error: {e}")
+        finally:
+            if self._term_settings is not None:
+                try:
+                    import sys
+                    import termios
+                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._term_settings)
+                except Exception:
+                    pass
+
     def construct_observations(self):
         """
         Construct the observation vector using observation function names from metadata.
@@ -781,7 +855,11 @@ class RLPolicyNode(Node):
             if obs_val is None:
                 raise RuntimeError(f"Observation function '{func_name}' returned None.")
             obs_list.append(np.asarray(obs_val, dtype=np.float32))
-        return np.concatenate(obs_list, axis=-1)
+
+        print(obs_list)
+        observations = np.concatenate(obs_list, axis=-1)
+        # print("Observations:", observations)
+        return observations
 
 
 def main(args=None):
