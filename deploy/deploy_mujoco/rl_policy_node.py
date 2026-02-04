@@ -261,22 +261,6 @@ class RLPolicyNode(Node):
         self.p_gain = self.isaac_to_mujoco(onnx_p_gain)
         self.d_gain = self.isaac_to_mujoco(onnx_d_gain)
         
-        # Identify wrist and waist joint indices in ONNX order to zero out
-        self.zero_joint_indices = []
-        # zero_joint_patterns = ['waist_roll', 'waist_pitch']
-        # for i, name in enumerate(self.joint_names):
-        #     if any(pattern in name for pattern in zero_joint_patterns):
-        #         self.zero_joint_indices.append(i)
-        # print(f"Zero joint indices (ONNX order): {self.zero_joint_indices}")
-
-        self.free_joint_indices = []
-        # free_joint_patterns = ['left_shoulder_pitch_joint', 'right_shoulder_pitch_joint', 'left_shoulder_roll_joint', 'right_shoulder_roll_joint', 'left_shoulder_yaw_joint', 'right_shoulder_yaw_joint', 'left_elbow_joint', 'right_elbow_joint', 'left_wrist_roll_joint', 'right_wrist_roll_joint', 'left_wrist_pitch_joint', 'right_wrist_pitch_joint', 'left_wrist_yaw_joint', 'right_wrist_yaw_joint']
-        free_joint_patterns = []
-        for i, name in enumerate(self.joint_names):
-            if any(pattern in name for pattern in free_joint_patterns):
-                self.free_joint_indices.append(i)
-        print(f"Free joint indices (ONNX order): {self.free_joint_indices}")
-
         # Create onnxruntime session for inference (use GPU if requested and available)
         if ort is None:
             raise RuntimeError(
@@ -520,11 +504,6 @@ class RLPolicyNode(Node):
 
 
     def policy_step(self):
-        """
-        Compute or lookup an IK candidate (cached) and expose it as observations,
-        then run ONNX inference (which may include the IK candidate via metadata).
-        IK is an observation candidate, not only a fallback.
-        """
         # Do not run policy until simulator signals control_enable
         if not getattr(self, "control_enabled", False):
             # Keep alive but skip heavy processing
@@ -545,26 +524,18 @@ class RLPolicyNode(Node):
                     self.motion_frame_idx = 0
                     self._play_motion_once = False
         
-        # Build velocity command and fetch nearest cached IK candidate
-        # Run ONNX inference (the policy may reference obs_ik_* in its observation_names)
         if hasattr(self, "onnx_sess") and self.onnx_sess is not None:
             try:
                 out0 = self._run_onnx_inference()  # numpy ndarray
                 # Prepare action, p gain, d gain arrays from metadata
                 action = out0.astype(np.float32).ravel()
-                # Zero out wrist and waist actions
-                # if hasattr(self, 'zero_joint_indices'):
-                #     action[self.zero_joint_indices] = 0.0
                 self.action = action.copy()
-                # if hasattr(self, 'zero_joint_indices'):
-                #     action[self.zero_joint_indices] = 0.0
                 p_gain = self.p_gain.astype(np.float32)
                 d_gain = self.d_gain.astype(np.float32)
                 # Concatenate [action, p_gain, d_gain]
                 msg = Float32MultiArray()
                 joint_pos = self.default_joint_pos + self.action * self.action_scale
-                if hasattr(self, 'free_joint_indices'):
-                    joint_pos[self.free_joint_indices] = self.default_joint_pos[self.free_joint_indices]
+
                 msg.data = np.concatenate(
                     [
                         self.isaac_to_mujoco(joint_pos),
@@ -575,7 +546,6 @@ class RLPolicyNode(Node):
                 self.action_pub.publish(msg)
                 return
             except Exception as e:
-                # ONNX inference failed; fall back to IK-first-frame or default
                 print(
                     f"ONNX inference failed: {e} — falling back to IK/default publish"
                 )
@@ -777,18 +747,10 @@ class RLPolicyNode(Node):
 
     def obs_joint_pos(self):
         joint_pos = self.mujoco_to_isaac(self.qj)
-        if hasattr(self, 'zero_joint_indices'):
-            joint_pos[self.zero_joint_indices] = self.default_joint_pos[self.zero_joint_indices]
-        if hasattr(self, 'free_joint_indices'):
-            joint_pos[self.free_joint_indices] = self.default_joint_pos[self.free_joint_indices]
         return joint_pos - self.default_joint_pos
 
     def obs_joint_vel(self):
         joint_vel = self.mujoco_to_isaac(self.dqj)
-        if hasattr(self, 'zero_joint_indices'):
-            joint_vel[self.zero_joint_indices] = 0.0
-        if hasattr(self, 'free_joint_indices'):
-            joint_vel[self.free_joint_indices] = 0.0
         return joint_vel
 
     def obs_actions(self):
@@ -856,9 +818,7 @@ class RLPolicyNode(Node):
                 raise RuntimeError(f"Observation function '{func_name}' returned None.")
             obs_list.append(np.asarray(obs_val, dtype=np.float32))
 
-        print(obs_list)
         observations = np.concatenate(obs_list, axis=-1)
-        # print("Observations:", observations)
         return observations
 
 
