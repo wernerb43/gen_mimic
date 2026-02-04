@@ -177,7 +177,7 @@ class Dex3HandController:
                 close_pos = MIN_LIMITS_RIGHT[i] + 0.70 * (MAX_LIMITS_RIGHT[i] - MIN_LIMITS_RIGHT[i])
             elif i == MOTOR_DICT["thumb_base"]:
                 # Thumb opens by going toward 80% of range
-                close_pos = MIN_LIMITS_RIGHT[i] + 0.30 * (MAX_LIMITS_RIGHT[i] - MIN_LIMITS_RIGHT[i])
+                close_pos = MIN_LIMITS_RIGHT[i] + 0.50 * (MAX_LIMITS_RIGHT[i] - MIN_LIMITS_RIGHT[i])
             elif i == MOTOR_DICT["thumb_rotate"]:
                 # Thumb rotate neutral position
                 close_pos = MIN_LIMITS_RIGHT[i] + 0.80 * (MAX_LIMITS_RIGHT[i] - MIN_LIMITS_RIGHT[i])  # Neutral position

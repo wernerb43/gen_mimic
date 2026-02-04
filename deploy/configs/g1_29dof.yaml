@@ -24,3 +24,7 @@ lowstate_topic: "rt/lowstate"
 msg_type: "hg" # "hg" or "go"
 imu_type: "pelvis" # "torso" or "pelvis"
 weak_motor: False
+# Hand control
+auto_hand_enabled: True
+auto_hand_open: True  # True: open, False: close
+auto_hand_frame: 117

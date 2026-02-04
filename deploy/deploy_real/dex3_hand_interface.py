@@ -72,7 +72,7 @@ class Dex3HandController:
         send_command(positions, kp=1.5, kd=0.1): Send custom position commands
         get_hand_state(): Get current hand state
     """
-    def __init__(self, hand_id_str, network_interface=None):
+    def __init__(self, hand_id_str, network_interface=None, initialize_dds=True):
         self.hand_id_str = hand_id_str.upper()
         self.is_left_hand = (self.hand_id_str == "L")
         
@@ -84,8 +84,11 @@ class Dex3HandController:
             self.dds_namespace = "rt/dex3/right"
             self.sub_namespace = "rt/dex3/right/state"
         
-        # Initialize DDS
-        ChannelFactoryInitialize(0, network_interface)
+        # Initialize DDS (optional if already initialized elsewhere)
+        if initialize_dds:
+            # if not network_interface:
+            #     raise ValueError("network_interface must be provided when initialize_dds=True")
+            ChannelFactoryInitialize(0, None)
         
         # Create publisher and subscriber
         self.handcmd_pub = ChannelPublisher(self.dds_namespace + "/cmd", HandCmd_)
@@ -131,10 +134,10 @@ class Dex3HandController:
             # Move to closed/grip position
             if i == MOTOR_DICT["middle_base"] or i == MOTOR_DICT["index_base"]:
                 # These motors close by going toward 70% of range
-                close_pos = self.min_limits[i] + 0.70 * (self.max_limits[i] - self.min_limits[i])
+                close_pos = self.min_limits[i] + 0.50 * (self.max_limits[i] - self.min_limits[i])
             elif i == MOTOR_DICT["thumb_base"]:
-                # Thumb closes at 30% of range
-                close_pos = self.min_limits[i] + 0.30 * (self.max_limits[i] - self.min_limits[i])
+                # Thumb closes at 60% of range
+                close_pos = self.min_limits[i] + 0.60 * (self.max_limits[i] - self.min_limits[i])
             elif i == MOTOR_DICT["thumb_rotate"]:
                 # Thumb rotate neutral position
                 close_pos = self.min_limits[i] + 0.80 * (self.max_limits[i] - self.min_limits[i])
@@ -263,14 +266,9 @@ def main():
         print("Invalid hand id. Please input 'L' or 'R'.")
         return -1
     
-    network_interface = None
-    if len(sys.argv) >= 2:
-        network_interface = sys.argv[1]
-        print(f"Using network interface: {network_interface}")
-    
     try:
         # Create controller
-        hand = Dex3HandController(hand_id, network_interface)
+        hand = Dex3HandController(hand_id, None, True)
         
         print("\nExample commands:")
         print("  Opening hand...")

@@ -19,7 +19,7 @@ import json
 import ast
 
 # Add current directory to path for local imports
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 try:
     import onnxruntime as ort
@@ -40,7 +40,7 @@ from common.command_helper import (
 )
 # from common.remote_controller import KeyMap, RemoteController
 # from common.rotation_helper import get_gravity_orientation, transform_imu_data
-from dex_hand_interface import Dex3HandController
+from dex3_hand_interface import Dex3HandController
 from geometry_msgs.msg import TransformStamped, Twist
 from nav_msgs.msg import GridCells
 # from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
@@ -264,8 +264,12 @@ class Controller(Node):
         # Initialize hand controllers
         try:
             network_interface = sys.argv[1] if len(sys.argv) >= 2 else None
-            self.left_hand = Dex3HandController("L", network_interface)
-            self.right_hand = Dex3HandController("R", network_interface)
+            if not network_interface:
+                raise ValueError("Missing network interface for hand controllers")
+            # DDS already initialized in main(); skip re-init here.
+            self.left_hand = None
+            # self.left_hand = Dex3HandController("L", network_interface, initialize_dds=False)
+            self.right_hand = Dex3HandController("R", network_interface, initialize_dds=False)
             self.get_logger().info("Hand controllers initialized")
         except Exception as e:
             self.get_logger().warning(f"Failed to initialize hand controllers: {e}")
@@ -298,6 +302,11 @@ class Controller(Node):
         self.msg_type = config.get("msg_type", "hg")
         self.imu_type = config.get("imu_type", "pelvis")
         self.weak_motor = config.get("weak_motor", False)
+
+        # Hand control parameters
+        self.auto_hand_enabled = config.get("auto_hand_enabled", False)
+        self.auto_hand_open = config.get("auto_hand_open", False)  # True: open, False: close
+        self.auto_hand_frame = config.get("auto_hand_frame", 0)
         
         # motion trajectory npz file
         self.motion_npz_path = config.get("motion_npz_path", "")
@@ -727,6 +736,11 @@ class Controller(Node):
                 if num_frames > 0:
                     if self.motion_frame_idx < num_frames - 1:
                         self.motion_frame_idx += 1
+                        if self.motion_frame_idx == self.auto_hand_frame and self.auto_hand_enabled:
+                            if self.auto_hand_open:
+                                self.open_hands()
+                            else:
+                                self.close_hands()
                     else:
                         # Reached end: reset to first frame and stop playback
                         self.motion_frame_idx = 0
@@ -985,7 +999,6 @@ class Controller(Node):
             if obs_val is None:
                 raise RuntimeError(f"Observation function '{func_name}' returned None.")
             obs_list.append(np.asarray(obs_val, dtype=np.float32))
-        print(obs_list)
         return np.concatenate(obs_list, axis=-1)
 
     def _run_onnx_inference(self):
