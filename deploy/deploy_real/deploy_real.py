@@ -499,34 +499,7 @@ class Controller(Node):
         self.get_logger().info(
             "Successfully loaded ONNX model and created onnxruntime session."
         )
-        
-        # Identify wrist and waist joint indices in ONNX order to zero out
-        self.zero_joint_indices = []
-        zero_joint_patterns = []
-        self.gain_add_indices = []
-        gain_add_patterns = []
-        for i, name in enumerate(self.joint_names):
-            if any(pattern in name for pattern in zero_joint_patterns):
-                self.zero_joint_indices.append(i)
-            if any(pattern in name for pattern in gain_add_patterns):
-                self.gain_add_indices.append(i)
-        print(f"Zero joint indices (ONNX order): {self.zero_joint_indices}")
-        print(f"Gain add indices (ONNX order): {self.gain_add_indices}")
-        
-        # Map zero joint indices to MuJoCo/hardware indices for motor disabling
-        self.zero_motor_indices = []
-        self.gain_add_motor_indices = []
-        for idx in self.zero_joint_indices:
-            # Convert ONNX index to MuJoCo index
-            mujoco_idx = self.isaac_to_mujoco_joint_indices[idx]
-            if mujoco_idx >= 0:
-                self.zero_motor_indices.append(mujoco_idx)
-        for idx in self.gain_add_indices:
-            mujoco_idx = self.isaac_to_mujoco_joint_indices[idx]
-            if mujoco_idx >= 0:
-                self.gain_add_motor_indices.append(mujoco_idx)
-        print(f"Zero motor indices (MuJoCo/hardware order): {self.zero_motor_indices}")
-        print(f"Gain add motor indices (MuJoCo/hardware order): {self.gain_add_motor_indices}")
+
 
     def _stop_rsp(self):
         try:
@@ -664,24 +637,13 @@ class Controller(Node):
             alpha = i / num_step
             for j in range(dof_size):
                 motor_idx = self.dof_idx_full[j]
-                # Check if this motor should be disabled (wrist/waist)
-                if hasattr(self, 'zero_motor_indices') and j in self.zero_motor_indices:
-                    # Disable motor (mode = 0)
-                    self.low_cmd.motor_cmd[motor_idx].q = 0
-                    self.low_cmd.motor_cmd[motor_idx].qd = 0
-                    self.low_cmd.motor_cmd[motor_idx].kp = 0
-                    self.low_cmd.motor_cmd[motor_idx].kd = 0
-                    self.low_cmd.motor_cmd[motor_idx].tau = 0
-                    self.low_cmd.motor_cmd[motor_idx].mode = 0  # 0:Disable
-                else:
-                    # Normal control for active motors
-                    target_pos = self.default_joint_pos_mujoco[j]
-                    self.low_cmd.motor_cmd[motor_idx].q = init_dof_pos[j] * (1 - alpha) + target_pos * alpha
-                    self.low_cmd.motor_cmd[motor_idx].qd = 0
-                    self.low_cmd.motor_cmd[motor_idx].kp = kps[j]
-                    self.low_cmd.motor_cmd[motor_idx].kd = kds[j]
-                    self.low_cmd.motor_cmd[motor_idx].tau = 0
-                    self.low_cmd.motor_cmd[motor_idx].mode = 1  # 1:Enable
+                target_pos = self.default_joint_pos_mujoco[j]
+                self.low_cmd.motor_cmd[motor_idx].q = init_dof_pos[j] * (1 - alpha) + target_pos * alpha
+                self.low_cmd.motor_cmd[motor_idx].qd = 0
+                self.low_cmd.motor_cmd[motor_idx].kp = kps[j]
+                self.low_cmd.motor_cmd[motor_idx].kd = kds[j]
+                self.low_cmd.motor_cmd[motor_idx].tau = 0
+                self.low_cmd.motor_cmd[motor_idx].mode = 1  # 1:Enable
 
             self.send_cmd(self.low_cmd)
             time.sleep(self.control_dt)
@@ -705,23 +667,12 @@ class Controller(Node):
         for step in range(1):
             for i in range(len(self.dof_idx_full)):
                 motor_idx = self.dof_idx_full[i]
-                # Check if this motor should be disabled (wrist/waist)
-                if hasattr(self, 'zero_motor_indices') and i in self.zero_motor_indices:
-                    # Disable motor (mode = 0)
-                    self.low_cmd.motor_cmd[motor_idx].q = 0
-                    self.low_cmd.motor_cmd[motor_idx].qd = 0
-                    self.low_cmd.motor_cmd[motor_idx].kp = 0
-                    self.low_cmd.motor_cmd[motor_idx].kd = 0
-                    self.low_cmd.motor_cmd[motor_idx].tau = 0
-                    self.low_cmd.motor_cmd[motor_idx].mode = 0  # 0:Disable
-                else:
-                    # Normal control for active motors
-                    self.low_cmd.motor_cmd[motor_idx].q = joint_pos_mujoco[i]
-                    self.low_cmd.motor_cmd[motor_idx].qd = 0
-                    self.low_cmd.motor_cmd[motor_idx].kp = self.p_gain_mujoco[i]
-                    self.low_cmd.motor_cmd[motor_idx].kd = self.d_gain_mujoco[i]
-                    self.low_cmd.motor_cmd[motor_idx].tau = 0
-                    self.low_cmd.motor_cmd[motor_idx].mode = 1  # 1:Enable
+                self.low_cmd.motor_cmd[motor_idx].q = joint_pos_mujoco[i]
+                self.low_cmd.motor_cmd[motor_idx].qd = 0
+                self.low_cmd.motor_cmd[motor_idx].kp = self.p_gain_mujoco[i]
+                self.low_cmd.motor_cmd[motor_idx].kd = self.d_gain_mujoco[i]
+                self.low_cmd.motor_cmd[motor_idx].tau = 0
+                self.low_cmd.motor_cmd[motor_idx].mode = 1  # 1:Enable
 
             # send the command
             self.send_cmd(self.low_cmd)
