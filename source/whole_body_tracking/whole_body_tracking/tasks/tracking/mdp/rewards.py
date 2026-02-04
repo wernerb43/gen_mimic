@@ -82,8 +82,18 @@ def feet_contact_time(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, thresh
     return reward
 
 
-def target_position_error_exp(env: ManagerBasedRLEnv, command_name: str, std: float) -> torch.Tensor:
+def target_position_error_exp(env: ManagerBasedRLEnv, target_command_name: str, motion_command_name: str, std: float) -> torch.Tensor:
     """Exponential reward for target position tracking error."""
-    command: TargetPositionCommand = env.command_manager.get_term(command_name)
-    error = torch.sum(torch.square(command.target_position_w - command.target_body_pos_w), dim=-1)
-    return torch.exp(-error / std**2)
+    target_command: TargetPositionCommand = env.command_manager.get_term(target_command_name)
+    motion_command: MotionCommand = env.command_manager.get_term(motion_command_name)
+    error = torch.sum(torch.square(target_command.target_position_w - target_command.target_body_pos_w), dim=-1)
+    reward = torch.exp(-error / std**2)
+    
+    phase = motion_command.time_steps/motion_command.motion.time_step_total
+    # print('--- phase and active ---')
+    # print(phase)
+    
+
+    active = (phase >= target_command.target_phase_start[0]) & (phase <= target_command.target_phase_end[0])
+    # print(active)
+    return reward * active.float()

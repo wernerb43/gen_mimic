@@ -42,6 +42,9 @@ class TargetPositionCommand(CommandTerm):
         
         # Target position in world frame
         self.target_position_w = torch.zeros(self.num_envs, 3, device=self.device)
+        # Target time window in motion timesteps (frame indices)
+        self.target_phase_start = torch.zeros(self.num_envs, device=self.device)
+        self.target_phase_end = torch.zeros(self.num_envs, device=self.device)
         
         # Initialize metrics
         self.metrics["error_target_pos"] = torch.zeros(self.num_envs, device=self.device)
@@ -73,6 +76,23 @@ class TargetPositionCommand(CommandTerm):
         # Set target position in world frame relative to robot anchor body
         anchor_pos_w = self.robot.data.body_pos_w[env_ids, self.robot_anchor_body_index]
         self.target_position_w[env_ids] = rand_samples + anchor_pos_w
+
+        # Sample target time window (motion timesteps)
+        t_start = sample_uniform(
+            self.cfg.target_phase_start_range[0],
+            self.cfg.target_phase_start_range[1],
+            (len(env_ids),),
+            device=self.device,
+        )
+        t_end = sample_uniform(
+            self.cfg.target_phase_end_range[0],
+            self.cfg.target_phase_end_range[1],
+            (len(env_ids),),
+            device=self.device,
+        )
+        t_end = torch.maximum(t_end, t_start)
+        self.target_phase_start[env_ids] = t_start
+        self.target_phase_end[env_ids] = t_end
 
     def _update_command(self):
         """Update command each step - no changes needed for static targets."""
@@ -126,6 +146,12 @@ class TargetPositionCommandCfg(CommandTermCfg):
 
     target_range: dict[str, tuple[float, float]] = {"x": (0.0, 0.0), "y": (0.0, 0.0), "z": (0.0, 0.0)}
     """Range for sampling target positions (x, y, z) in meters."""
+
+    target_phase_start_range: tuple[float, float] = (0.0, 0.0)
+    """Range for sampling target phase window start in motion timesteps."""
+
+    target_phase_end_range: tuple[float, float] = (1.0, 1.0)
+    """Range for sampling target phase window end in motion timesteps."""
 
 
 class MotionLoader:

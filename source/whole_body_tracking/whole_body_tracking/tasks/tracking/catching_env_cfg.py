@@ -100,14 +100,16 @@ class CommandsCfg:
     
     target_position = mdp.TargetPositionCommandCfg(
         asset_name="robot",
-        target_body_name="right_wrist_yaw_link",
+        target_body_name="left_wrist_yaw_link",
         resampling_time_range=(5.0, 10.0),
         debug_vis=True,
         target_range={
-            "x": (0.0, 0.0),
-            "y": (0.0, 0.0),
-            "z": (0.0, 0.0),
+            "x": (0.4, 0.4),
+            "y": (-0.2, 0.2),
+            "z": (-0.2, 0.2),
         },
+        target_phase_start_range=(0.45, 0.45),
+        target_phase_end_range=(0.55, 0.55),
     )
 
 
@@ -262,8 +264,8 @@ class RewardsCfg:
     )
     target_position_error = RewTerm(
         func=mdp.target_position_error_exp,
-        weight=10.0,
-        params={"command_name": "target_position", "std": 2},
+        weight=100.0,
+        params={"target_command_name": "target_position", "motion_command_name": "motion", "std": 2},
     )
 
 
