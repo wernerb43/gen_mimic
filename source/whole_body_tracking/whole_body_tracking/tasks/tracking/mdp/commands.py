@@ -169,9 +169,331 @@ class MultiMotionCommand(CommandTerm):
 
     def __init__(self, cfg: MultiMotionCommandCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
-        # TODO Implement multi-motion command that can handle multiple motion files and switch between them based on sampling or other criteria.
-        raise NotImplementedError("MultiMotionCommand is not implemented yet.")
+        self.robot: Articulation = env.scene[cfg.asset_name]
+        self.robot_anchor_body_index = self.robot.body_names.index(self.cfg.anchor_body_name)
+        self.motion_anchor_body_index = self.cfg.body_names.index(self.cfg.anchor_body_name)
+        self.body_indexes = torch.tensor(
+            self.robot.find_bodies(self.cfg.body_names, preserve_order=True)[0], dtype=torch.long, device=self.device
+        )
+
+        self.motions = []
+        for motion_file in self.cfg.motion_files:
+            self.motions.append(MotionLoader(motion_file, self.body_indexes, device=self.device))
+        self.which_motion = torch.zeros(self.num_envs, dtype=torch.long, device=self.device) # which motion to track for each env
+
+        self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.body_pos_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 3, device=self.device)
+        self.body_quat_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 4, device=self.device)
+        self.body_quat_relative_w[:, :, 0] = 1.0
+
+        # self.bin_count = int(self.motions[0].time_step_total // (1 / (env.cfg.decimation * env.cfg.sim.dt))) + 1
+
+        self.bin_counts = [int(self.motions[i].time_step_total // (1 / (env.cfg.decimation * env.cfg.sim.dt))) + 1 for i in range(len(self.motions))]
+        self.bin_failed_counts = [torch.zeros(self.bin_counts[i], dtype=torch.float, device=self.device) for i in range(len(self.motions))]
+        self._current_bin_failed = [torch.zeros(self.bin_counts[i], dtype=torch.float, device=self.device) for i in range(len(self.motions))]
+
+        self.kernel = torch.tensor(
+            [self.cfg.adaptive_lambda**i for i in range(self.cfg.adaptive_kernel_size)], device=self.device
+        )
+        self.kernel = self.kernel / self.kernel.sum()
+
+        self.metrics["error_anchor_pos"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_anchor_rot"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_anchor_lin_vel"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_anchor_ang_vel"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_body_pos"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_body_rot"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_joint_pos"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_joint_vel"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["sampling_entropy"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["sampling_top1_prob"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["sampling_top1_bin"] = torch.zeros(self.num_envs, device=self.device)
     
+
+    def _gather_motion_tensor(self, getter):
+        """Gather per-env data from the active motion for each env (vectorized per motion)."""
+        out = None
+        for i, motion in enumerate(self.motions):
+            mask = self.which_motion == i
+            if torch.any(mask):
+                data = getter(motion, mask)
+                if out is None:
+                    out = torch.zeros((self.num_envs,) + data.shape[1:], device=self.device, dtype=data.dtype)
+                out[mask] = data
+        return out
+
+
+    @property
+    def command(self) -> torch.Tensor:
+        return torch.cat([self.joint_pos, self.joint_vel], dim=1)
+    
+    @property
+    def joint_pos(self) -> torch.Tensor:
+        return self._gather_motion_tensor(lambda motion, mask: motion.joint_pos[self.time_steps[mask]])
+
+    @property
+    def joint_vel(self) -> torch.Tensor:
+        return self._gather_motion_tensor(lambda motion, mask: motion.joint_vel[self.time_steps[mask]])
+    
+    @property
+    def body_pos_w(self) -> torch.Tensor:
+        body_pos = self._gather_motion_tensor(lambda motion, mask: motion.body_pos_w[self.time_steps[mask]])
+        return body_pos + self._env.scene.env_origins[:, None, :]
+
+    @property
+    def body_quat_w(self) -> torch.Tensor:
+        return self._gather_motion_tensor(lambda motion, mask: motion.body_quat_w[self.time_steps[mask]])
+    
+    @property
+    def body_lin_vel_w(self) -> torch.Tensor:
+        return self._gather_motion_tensor(lambda motion, mask: motion.body_lin_vel_w[self.time_steps[mask]])
+
+    @property
+    def body_ang_vel_w(self) -> torch.Tensor:
+        return self._gather_motion_tensor(lambda motion, mask: motion.body_ang_vel_w[self.time_steps[mask]])
+
+    @property
+    def anchor_pos_w(self) -> torch.Tensor:
+        anchor_pos = self._gather_motion_tensor(
+            lambda motion, mask: motion.body_pos_w[self.time_steps[mask], self.motion_anchor_body_index]
+        )
+        return anchor_pos + self._env.scene.env_origins
+
+    @property
+    def anchor_quat_w(self) -> torch.Tensor:
+        return self._gather_motion_tensor(
+            lambda motion, mask: motion.body_quat_w[self.time_steps[mask], self.motion_anchor_body_index]
+        )
+
+    @property
+    def anchor_lin_vel_w(self) -> torch.Tensor:
+        return self._gather_motion_tensor(
+            lambda motion, mask: motion.body_lin_vel_w[self.time_steps[mask], self.motion_anchor_body_index]
+        )
+
+    @property
+    def anchor_ang_vel_w(self) -> torch.Tensor:
+        return self._gather_motion_tensor(
+            lambda motion, mask: motion.body_ang_vel_w[self.time_steps[mask], self.motion_anchor_body_index]
+        )
+    
+    @property
+    def robot_joint_pos(self) -> torch.Tensor:
+        return self.robot.data.joint_pos
+
+    @property
+    def robot_joint_vel(self) -> torch.Tensor:
+        return self.robot.data.joint_vel
+
+    @property
+    def robot_body_pos_w(self) -> torch.Tensor:
+        return self.robot.data.body_pos_w[:, self.body_indexes]
+
+    @property
+    def robot_body_quat_w(self) -> torch.Tensor:
+        return self.robot.data.body_quat_w[:, self.body_indexes]
+
+    @property
+    def robot_body_lin_vel_w(self) -> torch.Tensor:
+        return self.robot.data.body_lin_vel_w[:, self.body_indexes]
+
+    @property
+    def robot_body_ang_vel_w(self) -> torch.Tensor:
+        return self.robot.data.body_ang_vel_w[:, self.body_indexes]
+
+    @property
+    def robot_anchor_pos_w(self) -> torch.Tensor:
+        return self.robot.data.body_pos_w[:, self.robot_anchor_body_index]
+
+    @property
+    def robot_anchor_quat_w(self) -> torch.Tensor:
+        return self.robot.data.body_quat_w[:, self.robot_anchor_body_index]
+
+    @property
+    def robot_anchor_lin_vel_w(self) -> torch.Tensor:
+        return self.robot.data.body_lin_vel_w[:, self.robot_anchor_body_index]
+
+    @property
+    def robot_anchor_ang_vel_w(self) -> torch.Tensor:
+        return self.robot.data.body_ang_vel_w[:, self.robot_anchor_body_index]
+    
+    def _update_metrics(self):
+        self.metrics["error_anchor_pos"] = torch.norm(self.anchor_pos_w - self.robot_anchor_pos_w, dim=-1)
+        self.metrics["error_anchor_rot"] = quat_error_magnitude(self.anchor_quat_w, self.robot_anchor_quat_w)
+        self.metrics["error_anchor_lin_vel"] = torch.norm(self.anchor_lin_vel_w - self.robot_anchor_lin_vel_w, dim=-1)
+        self.metrics["error_anchor_ang_vel"] = torch.norm(self.anchor_ang_vel_w - self.robot_anchor_ang_vel_w, dim=-1)
+
+        self.metrics["error_body_pos"] = torch.norm(self.body_pos_relative_w - self.robot_body_pos_w, dim=-1).mean(
+            dim=-1
+        )
+        self.metrics["error_body_rot"] = quat_error_magnitude(self.body_quat_relative_w, self.robot_body_quat_w).mean(
+            dim=-1
+        )
+
+        self.metrics["error_body_lin_vel"] = torch.norm(self.body_lin_vel_w - self.robot_body_lin_vel_w, dim=-1).mean(
+            dim=-1
+        )
+        self.metrics["error_body_ang_vel"] = torch.norm(self.body_ang_vel_w - self.robot_body_ang_vel_w, dim=-1).mean(
+            dim=-1
+        )
+
+        self.metrics["error_joint_pos"] = torch.norm(self.joint_pos - self.robot_joint_pos, dim=-1)
+        self.metrics["error_joint_vel"] = torch.norm(self.joint_vel - self.robot_joint_vel, dim=-1)
+
+    def _adaptive_sampling(self, env_ids: Sequence[int]):
+        """Adaptive sampling that tracks failures per motion separately."""
+        episode_failed = self._env.termination_manager.terminated[env_ids]
+        
+        # Update failure counts for each motion
+        if torch.any(episode_failed):
+            for i in range(len(self.motions)):
+                # Get environments that use this motion and failed
+                motion_mask = self.which_motion[env_ids] == i
+                failed_mask = episode_failed & motion_mask
+                
+                if torch.any(failed_mask):
+                    # Calculate bin indices for failed environments using this motion
+                    current_bin_index = torch.clamp(
+                        (self.time_steps[env_ids[failed_mask]] * self.bin_counts[i]) // max(self.motions[i].time_step_total, 1), 
+                        0, self.bin_counts[i] - 1
+                    )
+                    fail_bins = current_bin_index
+                    self._current_bin_failed[i] = torch.bincount(fail_bins, minlength=self.bin_counts[i])
+        
+        # Compute sampling probabilities for all motions
+        sampling_probs_per_motion = []
+        for i in range(len(self.motions)):
+            sampling_probabilities = self.bin_failed_counts[i] + self.cfg.adaptive_uniform_ratio / float(self.bin_counts[i])
+            
+            # Apply temporal smoothing kernel
+            sampling_probabilities = torch.nn.functional.pad(
+                sampling_probabilities.unsqueeze(0).unsqueeze(0),
+                (0, self.cfg.adaptive_kernel_size - 1),
+                mode="replicate",
+            )
+            sampling_probabilities = torch.nn.functional.conv1d(
+                sampling_probabilities, self.kernel.view(1, 1, -1)
+            ).view(-1)
+            
+            # Normalize
+            sampling_probabilities = sampling_probabilities / sampling_probabilities.sum()
+            sampling_probs_per_motion.append(sampling_probabilities)
+        
+        # Vectorized sampling: sample bins for each environment based on its motion
+        sampled_bins = torch.zeros(len(env_ids), dtype=torch.long, device=self.device)
+        for i in range(len(self.motions)):
+            motion_mask = self.which_motion[env_ids] == i
+            if torch.any(motion_mask):
+                num_samples = motion_mask.sum().item()
+                sampled = torch.multinomial(sampling_probs_per_motion[i], num_samples, replacement=True)
+                sampled_bins[motion_mask] = sampled
+        
+        # Vectorized conversion from bins to timesteps
+        motion_indices = self.which_motion[env_ids]
+        bin_counts_for_envs = torch.tensor([self.bin_counts[m] for m in motion_indices.tolist()], device=self.device)
+        timestep_totals = torch.tensor([self.motions[m].time_step_total for m in motion_indices.tolist()], device=self.device)
+        
+        random_offsets = torch.rand(len(env_ids), device=self.device)
+        new_timesteps = (
+            (sampled_bins.float() + random_offsets) / bin_counts_for_envs.float() 
+            * (timestep_totals.float() - 1)
+        ).long()
+        self.time_steps[env_ids] = new_timesteps
+        
+        # Vectorized metrics computation
+        for i in range(len(self.motions)):
+            motion_mask = self.which_motion[env_ids] == i
+            if torch.any(motion_mask):
+                probs = sampling_probs_per_motion[i]
+                H = -(probs * (probs + 1e-12).log()).sum()
+                H_norm = H / math.log(self.bin_counts[i])
+                pmax, imax = probs.max(dim=0)
+                
+                # Get env_ids indices for this motion
+                env_indices = torch.where(motion_mask)[0]
+                actual_env_ids = torch.tensor([env_ids[j] for j in env_indices.tolist()], device=self.device)
+                
+                self.metrics["sampling_entropy"][actual_env_ids] = H_norm
+                self.metrics["sampling_top1_prob"][actual_env_ids] = pmax
+                self.metrics["sampling_top1_bin"][actual_env_ids] = imax.float() / self.bin_counts[i]
+
+    def _resample_command(self, env_ids: Sequence[int]):
+        if len(env_ids) == 0:
+            return
+        
+        # Choose which motion to track for each env FIRST
+        self.which_motion[env_ids] = torch.randint(0, len(self.motions), (len(env_ids),), device=self.device)
+        
+        # Then do adaptive sampling based on chosen motions
+        self._adaptive_sampling(env_ids)
+
+        # Set the root position to the body position in the motion
+        root_pos = self.body_pos_w[:, 0].clone()
+        root_ori = self.body_quat_w[:, 0].clone()
+        root_lin_vel = self.body_lin_vel_w[:, 0].clone()
+        root_ang_vel = self.body_ang_vel_w[:, 0].clone()
+
+        range_list = [self.cfg.pose_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]]
+        ranges = torch.tensor(range_list, device=self.device)
+        rand_samples = sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self.device)
+        root_pos[env_ids] += rand_samples[:, 0:3]
+        orientations_delta = quat_from_euler_xyz(rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5])
+        root_ori[env_ids] = quat_mul(orientations_delta, root_ori[env_ids])
+        
+        range_list = [self.cfg.velocity_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]]
+        ranges = torch.tensor(range_list, device=self.device)
+        rand_samples = sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self.device)
+        root_lin_vel[env_ids] += rand_samples[:, :3]
+        root_ang_vel[env_ids] += rand_samples[:, 3:]
+
+        joint_pos = self.joint_pos.clone()
+        joint_vel = self.joint_vel.clone()
+
+        joint_pos += sample_uniform(*self.cfg.joint_position_range, joint_pos.shape, joint_pos.device)
+        soft_joint_pos_limits = self.robot.data.soft_joint_pos_limits[env_ids]
+        joint_pos[env_ids] = torch.clip(
+            joint_pos[env_ids], soft_joint_pos_limits[:, :, 0], soft_joint_pos_limits[:, :, 1]
+        )
+        self.robot.write_joint_state_to_sim(joint_pos[env_ids], joint_vel[env_ids], env_ids=env_ids)
+        self.robot.write_root_state_to_sim(
+            torch.cat([root_pos[env_ids], root_ori[env_ids], root_lin_vel[env_ids], root_ang_vel[env_ids]], dim=-1),
+            env_ids=env_ids,
+        )
+
+    def _update_command(self):
+        """Update command each step: increment time steps, handle motion completion, and update adaptive tracking."""
+        self.time_steps += 1
+        
+        # Check which environments need to reset (motion finished) - vectorized
+        motion_indices = self.which_motion
+        timestep_limits = torch.tensor([self.motions[m].time_step_total for m in motion_indices.tolist()], device=self.device)
+        env_ids_to_reset = torch.where(self.time_steps >= timestep_limits)[0]
+        
+        if len(env_ids_to_reset) > 0:
+            self.time_steps[env_ids_to_reset] = 0
+            self._resample_command(env_ids_to_reset)
+
+        # Update relative body poses
+        anchor_pos_w_repeat = self.anchor_pos_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
+        anchor_quat_w_repeat = self.anchor_quat_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
+        robot_anchor_pos_w_repeat = self.robot_anchor_pos_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
+        robot_anchor_quat_w_repeat = self.robot_anchor_quat_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
+
+        delta_pos_w = robot_anchor_pos_w_repeat
+        delta_pos_w[..., 2] = anchor_pos_w_repeat[..., 2]
+        delta_ori_w = yaw_quat(quat_mul(robot_anchor_quat_w_repeat, quat_inv(anchor_quat_w_repeat)))
+
+        self.body_quat_relative_w = quat_mul(delta_ori_w, self.body_quat_w)
+        self.body_pos_relative_w = delta_pos_w + quat_apply(delta_ori_w, self.body_pos_w - anchor_pos_w_repeat)
+
+        # Update adaptive failure tracking per motion - vectorized
+        for i in range(len(self.motions)):
+            self.bin_failed_counts[i] = (
+                self.cfg.adaptive_alpha * self._current_bin_failed[i] 
+                + (1 - self.cfg.adaptive_alpha) * self.bin_failed_counts[i]
+            )
+            self._current_bin_failed[i].zero_()
+
 
 @configclass
 class MultiMotionCommandCfg(CommandTermCfg):
