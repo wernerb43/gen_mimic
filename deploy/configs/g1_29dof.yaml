@@ -1,9 +1,19 @@
-policy_path: "/home/blake/gen_mimic/logs/rsl_rl/g1_flat/2026-02-03_13-32-30_throw_no_waist_1/2026-02-03_13-32-30_throw_no_waist_1.onnx"
+policy_path: "/home/blake/gen_mimic/logs/rsl_rl/g1_flat/2026-02-05_19-38-30_catch_step_test/2026-02-05_19-38-30_catch_step_test.onnx"
 use_gpu: True
 plot_feet: False
 
 # Motion trajectory file (npz format from csv_to_npz.py)
-motion_npz_path: "/home/blake/gen_mimic/artifacts/throw_no_waist_1:v0/motion.npz"
+# For single motion, use motion_npz_path:
+# motion_npz_path: "/home/blake/gen_mimic/artifacts/catch_no_waist_2:v0/motion.npz"
+# For multiple motions, use motion_npz_paths (list):
+motion_npz_paths:
+    - "/home/blake/gen_mimic/artifacts/catch_right_step_1:v0/motion.npz"
+    - "/home/blake/gen_mimic/artifacts/catch_left_step_1:v0/motion.npz"
+  # - "/home/blake/gen_mimic/artifacts/catch_no_waist_2:v0/motion.npz"
+  # - "/home/blake/gen_mimic/artifacts/throw_2:v0/motion.npz"
+  # Add more motion files here for multi-motion support
+
+# xml_path: "/home/blake/gen_mimic/g1/scene_29dof_rl.xml"
 xml_path: "/home/blake/gen_mimic/g1/scene_29dof_rl.xml"
 robot_xml_path: "/home/blake/gen_mimic/g1/g1_29dof_rl.xml"
 urdf_path: "/home/blake/gen_mimic/source/whole_body_tracking/whole_body_tracking/assets/unitree_description/urdf/g1/main.urdf"
