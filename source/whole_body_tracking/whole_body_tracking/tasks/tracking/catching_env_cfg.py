@@ -105,7 +105,7 @@ class CommandsCfg:
         debug_vis=True,
         target_range={
             "x": (0.4, 0.4),
-            "y": (-0.2, 0.2),
+            "y": (-0.3, 0.3),
             "z": (-0.2, 0.2),
         },
         target_phase_start_range=(0.45, 0.45),
@@ -129,14 +129,13 @@ class ObservationsCfg:
         """Observations for policy group."""
 
         # observation terms (order preserved)
-        command = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion"})
-        motion_anchor_pos_b = ObsTerm(
-            func=mdp.motion_anchor_pos_b, params={"command_name": "motion"}, noise=Unoise(n_min=-0.25, n_max=0.25)
-        )
-        motion_anchor_ori_b = ObsTerm(
-            func=mdp.motion_anchor_ori_b, params={"command_name": "motion"}, noise=Unoise(n_min=-0.05, n_max=0.05)
-        )
-        base_lin_vel = ObsTerm(func=mdp.base_lin_vel, noise=Unoise(n_min=-0.5, n_max=0.5))
+        command_imitate = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion"})
+        command_target_position = ObsTerm(func=mdp.generated_commands, params={"command_name": "target_position"})
+        # motion_anchor_pos_b = ObsTerm(
+        #     func=mdp.motion_anchor_pos_b, params={"command_name": "motion"}, noise=Unoise(n_min=-0.25, n_max=0.25)
+        # )
+        motion_anchor_ori_b = ObsTerm(func=mdp.motion_anchor_ori_b, params={"command_name": "motion"}, noise=Unoise(n_min=-0.05, n_max=0.05))
+        # base_lin_vel = ObsTerm(func=mdp.base_lin_vel, noise=Unoise(n_min=-0.5, n_max=0.5))
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
         joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
         joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-0.5, n_max=0.5))
@@ -148,7 +147,8 @@ class ObservationsCfg:
 
     @configclass
     class PrivilegedCfg(ObsGroup):
-        command = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion"})
+        command_imitate = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion"})
+        command_target_position = ObsTerm(func=mdp.generated_commands, params={"command_name": "target_position"})
         motion_anchor_pos_b = ObsTerm(func=mdp.motion_anchor_pos_b, params={"command_name": "motion"})
         motion_anchor_ori_b = ObsTerm(func=mdp.motion_anchor_ori_b, params={"command_name": "motion"})
         body_pos = ObsTerm(func=mdp.robot_body_pos_b, params={"command_name": "motion"})
@@ -264,10 +264,9 @@ class RewardsCfg:
     )
     target_position_error = RewTerm(
         func=mdp.target_position_error_exp,
-        weight=100.0,
+        weight=10.0,
         params={"target_command_name": "target_position", "motion_command_name": "motion", "std": 2},
     )
-
 
 @configclass
 class TerminationsCfg:

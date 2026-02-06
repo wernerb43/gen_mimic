@@ -40,8 +40,12 @@ class TargetPositionCommand(CommandTerm):
         self.robot_anchor_body_index = self.robot.body_names.index(self.cfg.anchor_body_name)
         self.target_body_index = self.robot.body_names.index(self.cfg.target_body_name)
         
-        # Target position in world frame
+        # Target position in world frame (this is the one we want to use for plotting and for rewards)
         self.target_position_w = torch.zeros(self.num_envs, 3, device=self.device)
+
+        # Target position in the body frame (this is the one we want to send as observation)
+        self.target_position_b = torch.zeros(self.num_envs, 3, device=self.device)
+
         # Target time window in motion timesteps (frame indices)
         self.target_phase_start = torch.zeros(self.num_envs, device=self.device)
         self.target_phase_end = torch.zeros(self.num_envs, device=self.device)
@@ -51,8 +55,13 @@ class TargetPositionCommand(CommandTerm):
 
     @property
     def command(self) -> torch.Tensor:
-        """Returns the target position as the command."""
-        return self.target_position_w
+        """Returns the target position in body frame as the command observation."""
+        # Transform target position from world frame to body frame
+        anchor_pos_w = self.robot.data.body_pos_w[:, self.robot_anchor_body_index]
+        anchor_quat_w = self.robot.data.body_quat_w[:, self.robot_anchor_body_index]
+        anchor_quat_inv = quat_inv(anchor_quat_w)
+        self.target_position_b = quat_apply(anchor_quat_inv, self.target_position_w - anchor_pos_w)
+        return self.target_position_b
 
     @property
     def target_body_pos_w(self) -> torch.Tensor:
@@ -152,6 +161,45 @@ class TargetPositionCommandCfg(CommandTermCfg):
 
     target_phase_end_range: tuple[float, float] = (1.0, 1.0)
     """Range for sampling target phase window end in motion timesteps."""
+
+
+
+class MultiMotionCommand(CommandTerm):
+    cfg: MultiMotionCommandCfg
+
+    def __init__(self, cfg: MultiMotionCommandCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        # TODO Implement multi-motion command that can handle multiple motion files and switch between them based on sampling or other criteria.
+        raise NotImplementedError("MultiMotionCommand is not implemented yet.")
+    
+
+@configclass
+class MultiMotionCommandCfg(CommandTermCfg):
+    """Configuration for the motion command."""
+
+    class_type: type = MultiMotionCommand
+
+    asset_name: str = MISSING
+
+    motion_files: list[str] = []
+    anchor_body_name: str = MISSING
+    body_names: list[str] = MISSING
+
+    pose_range: dict[str, tuple[float, float]] = {}
+    velocity_range: dict[str, tuple[float, float]] = {}
+
+    joint_position_range: tuple[float, float] = (-0.52, 0.52)
+
+    adaptive_kernel_size: int = 1
+    adaptive_lambda: float = 0.8
+    adaptive_uniform_ratio: float = 0.1
+    adaptive_alpha: float = 0.001
+
+    anchor_visualizer_cfg: VisualizationMarkersCfg = FRAME_MARKER_CFG.replace(prim_path="/Visuals/Command/pose")
+    anchor_visualizer_cfg.markers["frame"].scale = (0.2, 0.2, 0.2)
+
+    body_visualizer_cfg: VisualizationMarkersCfg = FRAME_MARKER_CFG.replace(prim_path="/Visuals/Command/pose")
+    body_visualizer_cfg.markers["frame"].scale = (0.1, 0.1, 0.1)
 
 
 class MotionLoader:
