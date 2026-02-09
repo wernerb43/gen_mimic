@@ -60,6 +60,8 @@ class RLPolicyNode(Node):
         # Load minimal config (only keys present in YAML)
         self.load_config()
         # Load policy if desired (may be TorchScript); it's optional — node works without it.
+        self.initial_pose_index = 3
+
         self.load_policy()
         self.load_policy_metadata()
         # Load motion trajectory from npz file if provided
@@ -93,6 +95,7 @@ class RLPolicyNode(Node):
         # Motion playback control (policy mode)
         self._play_motion_once = False
         self._initial_yaw = None
+
         
         # Keyboard input handling for motion playback
         self._kb_request_play = False
@@ -137,10 +140,17 @@ class RLPolicyNode(Node):
             config.get("max_cmd", [1.0, 1.0, 1.0]), dtype=np.float32
         )
 
-        # motion trajectory npz file
-        self.motion_npz_path = config.get("motion_npz_path", "")
-        if self.motion_npz_path:
-            self.motion_npz_path = self.motion_npz_path.replace("{G1_RL_ROOT_DIR}", G1_RL_ROOT_DIR)
+        # motion trajectory npz file(s)
+        # Support both single motion_npz_path and multiple motion_npz_paths
+        self.motion_npz_paths = config.get("motion_npz_paths", [])
+        if not self.motion_npz_paths:
+            single_path = config.get("motion_npz_path", "")
+            if single_path:
+                self.motion_npz_paths = [single_path]
+        # Replace placeholder in all paths
+        self.motion_npz_paths = [
+            path.replace("{G1_RL_ROOT_DIR}", G1_RL_ROOT_DIR) for path in self.motion_npz_paths
+        ]
 
     def control_enable_callback(self, msg: Float64):
         try:
@@ -198,7 +208,6 @@ class RLPolicyNode(Node):
                     except Exception:
                         parsed_meta[k] = raw
 
-        # --- NEW: Convert string metadata entries to list by splitting on comma ---
         for k, v in parsed_meta.items():
             if isinstance(v, str):
                 parsed_meta[k] = [item.strip() for item in v.split(",") if item.strip()]
@@ -359,7 +368,7 @@ class RLPolicyNode(Node):
 
     def load_motion_trajectory(self):
         """
-        Load motion trajectory from npz file. The npz file should contain:
+        Load motion trajectory(ies) from npz file(s). Each npz file should contain:
         - fps: output fps of the motion
         - joint_pos: shape (T, num_joints)
         - joint_vel: shape (T, num_joints)
@@ -368,31 +377,38 @@ class RLPolicyNode(Node):
         - body_lin_vel_w: shape (T, num_bodies, 3)
         - body_ang_vel_w: shape (T, num_bodies, 3)
         """
-        self.motion_trajectory = None
-        self.motion_frame_idx = 0
+        self.motion_trajectories = []  # List of npz data
+        self.which_motion = 0  # Index of currently active motion
+        self.motion_frame_idx = self.initial_pose_index
         self._play_motion_once = False
         
-        if not self.motion_npz_path or self.motion_npz_path == "":
-            self.get_logger().info("No motion trajectory file specified, using zero placeholders")
+        if not self.motion_npz_paths or len(self.motion_npz_paths) == 0:
+            self.get_logger().info("No motion trajectory files specified, using zero placeholders")
             return
         
-        try:
-            if not os.path.exists(self.motion_npz_path):
-                self.get_logger().warn(f"Motion npz file not found: {self.motion_npz_path}")
-                return
-            
-            self.motion_trajectory = np.load(self.motion_npz_path)
-            motion_fps = self.motion_trajectory["fps"]
-            num_frames = self.motion_trajectory["joint_pos"].shape[0]
-            num_bodies = self.motion_trajectory["body_pos_w"].shape[1]
-            
-            self.get_logger().info(
-                f"Loaded motion trajectory from {self.motion_npz_path}: "
-                f"{num_frames} frames at {motion_fps} fps, {num_bodies} bodies"
-            )
-        except Exception as e:
-            self.get_logger().error(f"Failed to load motion trajectory: {e}")
-            self.motion_trajectory = None
+        for i, npz_path in enumerate(self.motion_npz_paths):
+            try:
+                if not os.path.exists(npz_path):
+                    self.get_logger().error(f"Motion file {i} not found: {npz_path}")
+                    continue
+                
+                motion_data = np.load(npz_path)
+                self.motion_trajectories.append(motion_data)
+                motion_fps = motion_data["fps"]
+                num_frames = motion_data["joint_pos"].shape[0]
+                num_bodies = motion_data["body_pos_w"].shape[1]
+                
+                self.get_logger().info(
+                    f"Loaded motion {i} from {npz_path}: "
+                    f"{num_frames} frames at {motion_fps} fps, {num_bodies} bodies"
+                )
+            except Exception as e:
+                self.get_logger().error(f"Failed to load motion {i}: {e}")
+        
+        if len(self.motion_trajectories) == 0:
+            self.get_logger().warn("No motion trajectories loaded successfully")
+        else:
+            self.get_logger().info(f"Successfully loaded {len(self.motion_trajectories)} motion(s)")
 
     def _compute_traj_velocities(self, pos_traj, dt):
         """
@@ -518,15 +534,31 @@ class RLPolicyNode(Node):
             print(f"[RLPolicyNode] Policy stepping started at sim_time={getattr(self,'sim_time',-1):.3f}", flush=True)
             self._policy_started = True
         
+        # Decide which motion to use based on ball's y position in body frame
+        if len(self.motion_trajectories) >= 3:
+            # Compute ball position in body frame
+            ball_pos_relative_w = self.ball_position - self.robot_position
+            q_inv = self._quat_conjugate(self.quat)
+            ball_pos_body = self._quat_rotate(q_inv, ball_pos_relative_w)
+            ball_y_body = ball_pos_body[1]
+            
+            # Select motion based on ball y position
+            if ball_y_body < -0.3:
+                self.which_motion = 0
+            elif ball_y_body > 0.3:
+                self.which_motion = 1
+            else:
+                self.which_motion = 2
+        
         # Handle motion playback: increment frame only if playback active
-        if self.motion_trajectory is not None and self._play_motion_once:
-            num_frames = self.motion_trajectory["joint_pos"].shape[0]
+        if len(self.motion_trajectories) > 0 and self.which_motion < len(self.motion_trajectories) and self._play_motion_once:
+            num_frames = self.motion_trajectories[self.which_motion]["joint_pos"].shape[0]
             if num_frames > 0:
                 if self.motion_frame_idx < num_frames - 1:
                     self.motion_frame_idx += 1
                 else:
                     # Reached end: reset to first frame and stop playback
-                    self.motion_frame_idx = 1
+                    self.motion_frame_idx = self.initial_pose_index
                     self._play_motion_once = False
         
         if hasattr(self, "onnx_sess") and self.onnx_sess is not None:
@@ -620,10 +652,10 @@ class RLPolicyNode(Node):
         # Return motion trajectory command: [joint_pos (motion), joint_vel (motion)]
         # This is the desired joint configuration and velocities from the motion being replayed
         # Size: 2 * num_joints (e.g., 58 for 29-DOF robot)
-        if self.motion_trajectory is not None:
+        if len(self.motion_trajectories) > 0 and self.which_motion < len(self.motion_trajectories):
             try:
-                joint_pos = self.motion_trajectory["joint_pos"][self.motion_frame_idx]
-                joint_vel = self.motion_trajectory["joint_vel"][self.motion_frame_idx]
+                joint_pos = self.motion_trajectories[self.which_motion]["joint_pos"][self.motion_frame_idx]
+                joint_vel = self.motion_trajectories[self.which_motion]["joint_vel"][self.motion_frame_idx]
                 cmd = np.concatenate([joint_pos, joint_vel]).astype(np.float32)
                 return cmd
             except Exception as e:
@@ -644,34 +676,34 @@ class RLPolicyNode(Node):
     def obs_motion_anchor_pos_b(self):
         # Return motion anchor body position error in robot base frame
         # This is: motion_anchor_pos_w - robot_anchor_pos_w, transformed to robot base frame
-        if self.motion_trajectory is not None:
-            # try:
+        if len(self.motion_trajectories) > 0 and self.which_motion < len(self.motion_trajectories):
+            try:
                 # Anchor body is typically the first body (index 0, pelvis/base)
-            motion_anchor_pos = self.motion_trajectory["body_pos_w"][self.motion_frame_idx, 0]  # (3,)
-            
-            # Robot anchor position is the robot's current position
-            robot_anchor_pos = self.robot_position  # (3,)
-            
-            # Position difference in world frame
-            pos_error_w = motion_anchor_pos - robot_anchor_pos
-            
-            # Transform to robot base frame using quaternion
-            # q_inv rotates from world to body frame
-            q_inv = self._quat_conjugate(self.quat)
-            pos_error_b = self._quat_rotate(q_inv, pos_error_w)
-            
-            return pos_error_b.astype(np.float32)
-            # except Exception as e:
-            #     self.get_logger().warn(f"Error computing motion anchor position: {e}")
+                motion_anchor_pos = self.motion_trajectories[self.which_motion]["body_pos_w"][self.motion_frame_idx, 0]  # (3,)
+                
+                # Robot anchor position is the robot's current position
+                robot_anchor_pos = self.robot_position  # (3,)
+                
+                # Position difference in world frame
+                pos_error_w = motion_anchor_pos - robot_anchor_pos
+                
+                # Transform to robot base frame using quaternion
+                # q_inv rotates from world to body frame
+                q_inv = self._quat_conjugate(self.quat)
+                pos_error_b = self._quat_rotate(q_inv, pos_error_w)
+                
+                return pos_error_b.astype(np.float32)
+            except Exception as e:
+                self.get_logger().warn(f"Error computing motion anchor position: {e}")
         return np.zeros(3, dtype=np.float32)
 
     def obs_motion_anchor_ori_b(self):
         # Return motion anchor body orientation error in robot base frame as 6D encoding
         # Format: [r00, r01, r10, r11, r20, r21] - first two columns of 3x3 rotation matrix
-        if self.motion_trajectory is not None:
+        if len(self.motion_trajectories) > 0 and self.which_motion < len(self.motion_trajectories):
             try:
                 # Get motion anchor orientation (first body, pelvis/base)
-                motion_anchor_quat = self.motion_trajectory["body_quat_w"][self.motion_frame_idx, 0]  # (4,) wxyz
+                motion_anchor_quat = self.motion_trajectories[self.which_motion]["body_quat_w"][self.motion_frame_idx, 0]  # (4,) wxyz
                 
                 # Robot anchor orientation is the robot's current quaternion
                 robot_anchor_quat = self.quat  # (4,) wxyz
@@ -806,7 +838,7 @@ class RLPolicyNode(Node):
                 raise RuntimeError(f"Observation function '{func_name}' returned None.")
             obs_list.append(np.asarray(obs_val, dtype=np.float32))
 
-        print(obs_list)
+        # print(obs_list)
         observations = np.concatenate(obs_list, axis=-1)
         return observations
 
