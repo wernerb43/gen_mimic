@@ -93,7 +93,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     import pathlib
     import wandb
-    print('[INFO] Loading motion files: ', env_cfg.commands.motion.motion_files)
 
     for i, registry_name in enumerate(registry_names):
         if ":" not in registry_name:  # Check if the registry name includes alias, if not, append ":latest"
@@ -102,6 +101,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         api = wandb.Api()
         artifact = api.artifact(registry_name)
         env_cfg.commands.motion.motion_files.append(str(pathlib.Path(artifact.download()) / "motion.npz"))
+
+    print('[INFO] Loading motion files: ', env_cfg.commands.motion.motion_files)
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
