@@ -576,6 +576,9 @@ class MultiMotionCommand(CommandTerm):
         )
         self.kernel = self.kernel / self.kernel.sum()
 
+        self.between_motion_pause_length = 1.0
+        self.between_motion_pause_time = torch.zeros(self.num_envs, device=self.device)
+
         self.metrics["error_anchor_pos"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["error_anchor_rot"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["error_anchor_lin_vel"] = torch.zeros(self.num_envs, device=self.device)
@@ -601,59 +604,58 @@ class MultiMotionCommand(CommandTerm):
                 out[mask] = data
         return out
 
-
     @property
     def command(self) -> torch.Tensor:
         return torch.cat([self.joint_pos, self.joint_vel], dim=1)
     
     @property
     def joint_pos(self) -> torch.Tensor:
-        return self._gather_motion_tensor(lambda motion, mask: motion.joint_pos[self.time_steps[mask]])
+        return self._gather_motion_tensor(lambda motion, mask: motion.joint_pos[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask])])
 
     @property
     def joint_vel(self) -> torch.Tensor:
-        return self._gather_motion_tensor(lambda motion, mask: motion.joint_vel[self.time_steps[mask]])
+        return self._gather_motion_tensor(lambda motion, mask: motion.joint_vel[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask])])
     
     @property
     def body_pos_w(self) -> torch.Tensor:
-        body_pos = self._gather_motion_tensor(lambda motion, mask: motion.body_pos_w[self.time_steps[mask]])
+        body_pos = self._gather_motion_tensor(lambda motion, mask: motion.body_pos_w[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask])])
         return body_pos + self._env.scene.env_origins[:, None, :]
 
     @property
     def body_quat_w(self) -> torch.Tensor:
-        return self._gather_motion_tensor(lambda motion, mask: motion.body_quat_w[self.time_steps[mask]])
+        return self._gather_motion_tensor(lambda motion, mask: motion.body_quat_w[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask])])
     
     @property
     def body_lin_vel_w(self) -> torch.Tensor:
-        return self._gather_motion_tensor(lambda motion, mask: motion.body_lin_vel_w[self.time_steps[mask]])
+        return self._gather_motion_tensor(lambda motion, mask: motion.body_lin_vel_w[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask])])
 
     @property
     def body_ang_vel_w(self) -> torch.Tensor:
-        return self._gather_motion_tensor(lambda motion, mask: motion.body_ang_vel_w[self.time_steps[mask]])
+        return self._gather_motion_tensor(lambda motion, mask: motion.body_ang_vel_w[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask])])
 
     @property
     def anchor_pos_w(self) -> torch.Tensor:
         anchor_pos = self._gather_motion_tensor(
-            lambda motion, mask: motion.body_pos_w[self.time_steps[mask], self.motion_anchor_body_index]
+            lambda motion, mask: motion.body_pos_w[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask]), self.motion_anchor_body_index]
         )
         return anchor_pos + self._env.scene.env_origins
 
     @property
     def anchor_quat_w(self) -> torch.Tensor:
         return self._gather_motion_tensor(
-            lambda motion, mask: motion.body_quat_w[self.time_steps[mask], self.motion_anchor_body_index]
+            lambda motion, mask: motion.body_quat_w[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask]), self.motion_anchor_body_index]
         )
 
     @property
     def anchor_lin_vel_w(self) -> torch.Tensor:
         return self._gather_motion_tensor(
-            lambda motion, mask: motion.body_lin_vel_w[self.time_steps[mask], self.motion_anchor_body_index]
+            lambda motion, mask: motion.body_lin_vel_w[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask]), self.motion_anchor_body_index]
         )
 
     @property
     def anchor_ang_vel_w(self) -> torch.Tensor:
         return self._gather_motion_tensor(
-            lambda motion, mask: motion.body_ang_vel_w[self.time_steps[mask], self.motion_anchor_body_index]
+            lambda motion, mask: motion.body_ang_vel_w[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask]), self.motion_anchor_body_index]
         )
     
     @property
@@ -845,9 +847,13 @@ class MultiMotionCommand(CommandTerm):
         
         # Check which environments need to reset (motion finished) - vectorized
         motion_indices = self.which_motion
+
         timestep_limits = torch.tensor([self.motions[m].time_step_total for m in motion_indices.tolist()], device=self.device)
-        env_ids_to_reset = torch.where(self.time_steps >= timestep_limits)[0]
-        
+        env_ids_at_end_of_motion = torch.where(self.time_steps >= timestep_limits)[0]
+        self.between_motion_pause_time[env_ids_at_end_of_motion] += self._env.cfg.sim.dt
+        env_ids_to_reset = env_ids_at_end_of_motion[self.between_motion_pause_time[env_ids_at_end_of_motion] >= self.between_motion_pause_length]
+        self.between_motion_pause_time[env_ids_to_reset] = 0.0
+
         if len(env_ids_to_reset) > 0:
             self.time_steps[env_ids_to_reset] = 0
             self._resample_command(env_ids_to_reset)
