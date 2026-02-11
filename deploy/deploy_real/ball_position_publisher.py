@@ -32,7 +32,7 @@ class BallPositionPublisher(Node):
         
         # Initial ball position (x, y, z in meters)
         # Modify these values as needed
-        self.ball_position = np.array([0.4, -0.7, 0.0], dtype=np.float32)
+        self.ball_position = np.array([0.4, -0.2, 0.1], dtype=np.float32)
         
         self.get_logger().info(
             f"Ball Position Publisher started at {frequency} Hz\n"
