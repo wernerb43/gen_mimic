@@ -36,9 +36,13 @@ class TargetPositionCommand(CommandTerm):
 
         self.robot: Articulation = env.scene[cfg.asset_name]
         print('body names:')
-        print(self.robot.body_names)
+        # print(self.robot.body_names)
+        print(self.robot.data.body_names)
+
         self.robot_anchor_body_index = self.robot.body_names.index(self.cfg.anchor_body_name)
-        self.target_body_index = self.robot.body_names.index(self.cfg.target_body_name)
+        # print(self.robot.body_names)
+
+        self.source_body_index = self.robot.body_names.index(self.cfg.source_link_name)
         
         # Target position in world frame (this is the one we want to use for plotting and for rewards)
         self.target_position_w = torch.zeros(self.num_envs, 3, device=self.device)
@@ -46,45 +50,108 @@ class TargetPositionCommand(CommandTerm):
         # Target position in the body frame (this is the one we want to send as observation)
         self.target_position_b = torch.zeros(self.num_envs, 3, device=self.device)
 
+        # Target orientation in world frame
+        self.target_orientation_w = torch.zeros(self.num_envs, 4, device=self.device)
+
+        # Target orientation in body frame
+        self.target_orientation_b = torch.zeros(self.num_envs, 4, device=self.device)
+
         # Target time window in motion timesteps (frame indices)
         self.target_phase_start = torch.zeros(self.num_envs, device=self.device)
         self.target_phase_end = torch.zeros(self.num_envs, device=self.device)
         
+        # If we want a handoff, we need to go not to a static position, but to a changing position
+        self.track_link_target = False
+        # self.target_link_name= self.cfg.target_link_name  # e.g. 'right_hand' if we want to track the other hand during a handoff
+        self.target_link_name = self.cfg.target_link_name
+        if self.target_link_name:
+            self.track_link_target = True
+            self.target_body_index = self.robot.body_names.index(self.cfg.target_link_name)
+
+            # print("Tracking target link:", self.target_link_name)
+            # self.target_link_index = self.robot.body_names.index(self.target_link_name)
+
         # Initialize metrics
         self.metrics["error_target_pos"] = torch.zeros(self.num_envs, device=self.device)
 
     @property
     def command(self) -> torch.Tensor:
         """Returns the target position in body frame as the command observation."""
+
         # Transform target position from world frame to body frame
         anchor_pos_w = self.robot.data.body_pos_w[:, self.robot_anchor_body_index]
         anchor_quat_w = self.robot.data.body_quat_w[:, self.robot_anchor_body_index]
         anchor_quat_inv = quat_inv(anchor_quat_w)
         self.target_position_b = quat_apply(anchor_quat_inv, self.target_position_w - anchor_pos_w)
-        return self.target_position_b
+
+        # Transform target orientation from world frame to body frame
+        self.target_orientation_b = quat_mul(anchor_quat_inv, self.target_orientation_w)
+
+        return torch.cat([self.target_position_b, self.target_orientation_b], dim=-1)
 
     @property
     def target_body_pos_w(self) -> torch.Tensor:
         """Current position of the target body in world frame."""
+        if not self.track_link_target:
+            raise ValueError("target_body_pos_w is only available when track_link_target is True")
         return self.robot.data.body_pos_w[:, self.target_body_index]
+        # return self.robot.data.body_pos_w[:, self.target_body_index]
     
+    @property
+    def source_body_pos_w(self) -> torch.Tensor:
+        """Current position of the source body in world frame."""
+        return self.robot.data.body_pos_w[:, self.source_body_index]
+        # return self.robot.data.body_pos_w[:, self.source_body_index]
+    
+    @property 
+    def target_body_quat_w(self) -> torch.Tensor:
+        """Current orientation of the target body in world frame."""
+        if not self.track_link_target:
+            raise ValueError("target_body_quat_w is only available when track_link_target is True")
+        return self.robot.data.body_quat_w[:, self.target_body_index]
+    
+    @property
+    def source_body_quat_w(self) -> torch.Tensor:
+        """Current orientation of the source body in world frame."""
+        return self.robot.data.body_quat_w[:, self.source_body_index]
+
     def _update_metrics(self):
         """Update tracking error: distance between target body position and target position."""
-        self.metrics["error_target_pos"] = torch.norm(self.target_body_pos_w - self.target_position_w, dim=-1)
+        self.metrics["error_target_pos"] = torch.norm(self.source_body_pos_w - self.target_position_w, dim=-1)
 
     def _resample_command(self, env_ids: Sequence[int]):
         """Resample target position with random values within specified range."""
         if len(env_ids) == 0:
             return
         
-        # Sample target position within specified range
-        range_list = [self.cfg.target_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z"]]
-        ranges = torch.tensor(range_list, device=self.device)
-        rand_samples = sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 3), device=self.device)
-        
-        # Set target position in world frame relative to robot anchor body
-        anchor_pos_w = self.robot.data.body_pos_w[env_ids, self.robot_anchor_body_index]
-        self.target_position_w[env_ids] = rand_samples + anchor_pos_w
+        if self.track_link_target:
+            # If tracking a target link, we don't sample a random position. Instead we just set the target position to the current position of the target link.
+            # self.target_position_w[env_ids] = self.robot.data.body_pos_w[env_ids, self.target_link_index]
+            self.target_position_w[env_ids] = self.target_body_pos_w[env_ids] + torch.tensor(self.cfg.target_pos_offset, device=self.device)
+            offset = torch.tensor(self.cfg.target_euler_angle_offset, device=self.device)
+            offset_quat = quat_from_euler_xyz(offset[0], offset[1], offset[2])
+            offset_quat_expanded = offset_quat.expand(self.target_body_quat_w[env_ids].shape)
+            self.target_orientation_w[env_ids] = quat_mul(self.target_body_quat_w[env_ids], offset_quat_expanded)
+        else:
+            # Sample target position within specified range
+            pos_range_list = [self.cfg.target_pos_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z"]]
+            pos_ranges = torch.tensor(pos_range_list, device=self.device)
+            rand_samples = sample_uniform(pos_ranges[:, 0], pos_ranges[:, 1], (len(env_ids), 3), device=self.device)
+            
+            # Sample target orientation within specified range
+            euler_range_list = [self.cfg.target_euler_angle_range.get(key, (0.0, 0.0)) for key in ["roll", "pitch", "yaw"]]
+            euler_ranges = torch.tensor(euler_range_list, device=self.device)
+            rand_euler = sample_uniform(euler_ranges[:, 0], euler_ranges[:, 1], (len(env_ids), 3), device=self.device)
+            rand_quat = quat_from_euler_xyz(rand_euler)
+
+            # Set target position in world frame relative to robot anchor body
+            anchor_pos_w = self.robot.data.body_pos_w[env_ids, self.robot_anchor_body_index]
+            self.target_position_w[env_ids] = rand_samples + anchor_pos_w
+
+            # Set target orientation in world frame relative to robot anchor body
+            anchor_quat_w = self.robot.data.body_quat_w[env_ids, self.robot_anchor_body_index]
+            self.target_orientation_w[env_ids] = quat_mul(anchor_quat_w, rand_quat)
+
 
         # Sample target time window (motion timesteps)
         t_start = sample_uniform(
@@ -104,8 +171,15 @@ class TargetPositionCommand(CommandTerm):
         self.target_phase_end[env_ids] = t_end
 
     def _update_command(self):
-        """Update command each step - no changes needed for static targets."""
-        pass
+        """Update command each step - track moving target if enabled."""
+        if self.track_link_target:
+            # print('Tracking target link position for link:', self.target_link_name)
+            # Update target position to follow the target link
+            self.target_position_w = self.target_body_pos_w + torch.tensor(self.cfg.target_pos_offset, device=self.device)
+            offset = torch.tensor(self.cfg.target_euler_angle_offset, device=self.device)
+            offset_quat = quat_from_euler_xyz(offset[0], offset[1], offset[2])
+            offset_quat_expanded = offset_quat.expand(self.target_body_quat_w.shape)
+            self.target_orientation_w = quat_mul(self.target_body_quat_w, offset_quat_expanded)
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         """Enable/disable debug visualization."""
@@ -135,8 +209,9 @@ class TargetPositionCommand(CommandTerm):
         # Use identity rotation for the visualization
         identity_quat = torch.zeros(self.num_envs, 4, device=self.device)
         identity_quat[:, 0] = 1.0
-        self.target_visualizer.visualize(self.target_position_w, identity_quat)
+        self.target_visualizer.visualize(self.target_position_w, self.target_orientation_w)
         print('Visualizing target at position:', self.target_position_w.cpu().numpy())
+
 
 @configclass
 class TargetPositionCommandCfg(CommandTermCfg):
@@ -150,11 +225,23 @@ class TargetPositionCommandCfg(CommandTermCfg):
     anchor_body_name: str = MISSING
     """Name of the anchor body used as reference for sampling target positions."""
 
-    target_body_name: str = MISSING
+    source_link_name: str = MISSING
     """Name of the body/link that should reach the target position (e.g., 'left_hand', 'right_hand')."""
 
-    target_range: dict[str, tuple[float, float]] = {"x": (0.0, 0.0), "y": (0.0, 0.0), "z": (0.0, 0.0)}
+    target_link_name: str = None
+    """Name of of the body that we want the other part of the body to go to (eg for handoff we want to track the other hand)"""
+
+    target_pos_range: dict[str, tuple[float, float]] = {"x": (0.0, 0.0), "y": (0.0, 0.0), "z": (0.0, 0.0)}
     """Range for sampling target positions (x, y, z) in meters."""
+
+    target_euler_angle_range: dict[str, tuple[float, float]] = {"roll": (0.0, 0.0), "pitch": (0.0, 0.0), "yaw": (0.0, 0.0)}
+    """Range for sampling target orientations as euler angles (x, y, z, w). Note: sampled quaternions will be normalized."""
+
+    target_pos_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    """Offset added to the sampled target position in meters (applied after sampling, in world frame)."""
+
+    target_euler_angle_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    """Offset added to the sampled target orientation as euler angles (x, y, z) in radians (applied after sampling, in world frame)."""
 
     target_phase_start_range: tuple[float, float] = (0.0, 0.0)
     """Range for sampling target phase window start in motion timesteps."""

@@ -81,6 +81,26 @@ class MySceneCfg(InteractiveSceneCfg):
 @configclass
 class CommandsCfg:
     """Command specifications for the MDP."""
+    
+    target_position = mdp.TargetPositionCommandCfg(
+        asset_name="robot",
+        resampling_time_range=(1.0e9, 1.0e9),
+        debug_vis=True,
+        target_pos_offset = (0.0, 0.0, 0.0),
+        target_euler_angle_offset = (0.0, 0.0, 0.0),
+        # target_pos_range={
+        #     "x": (0.4, 0.4),
+        #     "y": (-0.7, -0.2),
+        #     "z": (-0.1, 0.3),
+        # },
+        # target_euler_angle_range={
+        #     "roll": (-0.2, 0.2),
+        #     "pitch": (-0.2, 0.2),
+        #     "yaw": (-0.4, 0.4),
+        # },
+        target_phase_start_range=(0.45, 0.45),
+        target_phase_end_range=(0.55, 0.55),
+    )
 
     motion = mdp.MotionCommandCfg(
         asset_name="robot",
@@ -96,20 +116,6 @@ class CommandsCfg:
         },
         velocity_range=VELOCITY_RANGE,
         joint_position_range=(-0.1, 0.1),
-    )
-    
-    target_position = mdp.TargetPositionCommandCfg(
-        asset_name="robot",
-        target_body_name="left_wrist_yaw_link",
-        resampling_time_range=(1.0e9, 1.0e9),
-        debug_vis=True,
-        target_range={
-            "x": (0.4, 0.4),
-            "y": (-0.7, -0.2),
-            "z": (-0.1, 0.1),
-        },
-        target_phase_start_range=(0.45, 0.45),
-        target_phase_end_range=(0.55, 0.55),
     )
 
 
@@ -128,9 +134,8 @@ class ObservationsCfg:
     class PolicyCfg(ObsGroup):
         """Observations for policy group."""
 
-        # observation terms (order preserved)
         command_imitate = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion"})
-        command_target_position = ObsTerm(func=mdp.generated_commands, params={"command_name": "target_position"})
+        # command_target_position = ObsTerm(func=mdp.generated_commands, params={"command_name": "target_position"})
         # motion_anchor_pos_b = ObsTerm(
         #     func=mdp.motion_anchor_pos_b, params={"command_name": "motion"}, noise=Unoise(n_min=-0.25, n_max=0.25)
         # )
@@ -264,6 +269,12 @@ class RewardsCfg:
     )
     target_position_error = RewTerm(
         func=mdp.target_position_error_exp,
+        weight=20.0,
+        params={"target_command_name": "target_position", "motion_command_name": "motion", "std": 0.5},
+    )
+
+    target_orientation_error = RewTerm(
+        func=mdp.target_orientation_error_exp,
         weight=20.0,
         params={"target_command_name": "target_position", "motion_command_name": "motion", "std": 0.5},
     )

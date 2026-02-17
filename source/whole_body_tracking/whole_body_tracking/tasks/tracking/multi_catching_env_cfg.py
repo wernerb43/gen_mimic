@@ -84,13 +84,13 @@ class CommandsCfg:
 
     target_position = mdp.TargetPositionCommandCfg(
         asset_name="robot",
-        target_body_name="left_wrist_yaw_link",
+        # target_body_name="left_wrist_yaw_link",
         resampling_time_range=(1.0e9, 1.0e9),
         debug_vis=True,
-        target_range={
+        target_pos_range={
             "x": (0.4, 0.4),
-            "y": (-0.2, 0.7),
-            "z": (-0.1, 0.1),
+            "y": (-0.3, 0.6),
+            "z": (-0.1, 0.3),
         },
         target_phase_start_range=(0.45, 0.45),
         target_phase_end_range=(0.55, 0.55),
@@ -113,8 +113,6 @@ class CommandsCfg:
     )
         
 
-
-
 @configclass
 class ActionsCfg:
     """Action specifications for the MDP."""
@@ -130,10 +128,8 @@ class ObservationsCfg:
     class PolicyCfg(ObsGroup):
         """Observations for policy group."""
 
-        # observation terms (order preserved)
         command_imitate = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion"})
         command_target_position = ObsTerm(func=mdp.generated_commands, params={"command_name": "target_position"})
-
         # motion_anchor_pos_b = ObsTerm(
         #     func=mdp.motion_anchor_pos_b, params={"command_name": "motion"}, noise=Unoise(n_min=-0.25, n_max=0.25)
         # )
@@ -318,7 +314,6 @@ class CurriculumCfg:
 @configclass
 class MultiCatchingEnvCfg(ManagerBasedRLEnvCfg):
     """Configuration for the locomotion velocity-tracking environment."""
-
     # Scene settings
     scene: MySceneCfg = MySceneCfg(num_envs=4096, env_spacing=2.5)
     # Basic settings

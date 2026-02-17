@@ -112,6 +112,10 @@ class G1CatchingFlatEnvCfg(CatchingEnvCfg):
             "right_elbow_link",
             "right_wrist_yaw_link",
         ]
+        self.commands.target_position.source_link_name = "right_palm_link"
+        self.commands.target_position.target_link_name = "left_palm_link"
+
+
 
 
 @configclass
