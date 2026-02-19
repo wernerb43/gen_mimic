@@ -109,16 +109,18 @@ def target_orientation_error_exp(env: ManagerBasedRLEnv, target_command_name: st
     return reward * active.float()
 
 
-def multi_motion_target_position_error_exp(env: ManagerBasedRLEnv, target_command_name: str, motion_command_name: str, std: float) -> torch.Tensor:
+def multi_motion_target_position_error_exp(env: ManagerBasedRLEnv, target_command_name: str, motion_command_name: str, std: float, motion_to_reward: int) -> torch.Tensor:
     """Exponential reward for target position tracking error."""
     target_command: TargetPositionCommand = env.command_manager.get_term(target_command_name)
     motion_command: MotionCommand = env.command_manager.get_term(motion_command_name)
-    error = torch.sum(torch.square(target_command.target_position_w - target_command.target_body_pos_w), dim=-1)
 
-    # print("error:", error)
+    which_motion = motion_command.which_motion
+    correct_motion = (which_motion == motion_to_reward)
+
+    error = torch.sum(torch.square(target_command.target_position_w - target_command.source_body_pos_w), dim=-1)
+
     reward = torch.exp(-error / std**2)
     
-    which_motion = motion_command.which_motion
     # Gather time_step_total for each motion in the batch
     time_step_totals = torch.tensor(
         [motion.time_step_total for motion in motion_command.motions],
@@ -129,4 +131,29 @@ def multi_motion_target_position_error_exp(env: ManagerBasedRLEnv, target_comman
     phase = motion_command.time_steps / time_step_total
 
     active = (phase >= target_command.target_phase_start[0]) & (phase <= target_command.target_phase_end[0])
-    return reward * active.float()
+    return reward * active.float() * correct_motion.float()
+
+
+def multi_motion_target_orientation_error_exp(env: ManagerBasedRLEnv, target_command_name: str, motion_command_name: str, std: float, motion_to_reward: int) -> torch.Tensor:
+    """Exponential reward for target orientation tracking error."""
+    target_command: TargetPositionCommand = env.command_manager.get_term(target_command_name)
+    motion_command: MotionCommand = env.command_manager.get_term(motion_command_name)
+    
+    which_motion = motion_command.which_motion
+    correct_motion = (which_motion == motion_to_reward)
+    
+    error = quat_error_magnitude(target_command.target_orientation_w, target_command.source_body_quat_w) ** 2
+    reward = torch.exp(-error / std**2)
+    
+    # Gather time_step_total for each motion in the batch
+    time_step_totals = torch.tensor(
+        [motion.time_step_total for motion in motion_command.motions],
+        device=motion_command.device,
+        dtype=torch.float32
+    )
+    time_step_total = time_step_totals[which_motion]
+    phase = motion_command.time_steps / time_step_total
+
+    active = (phase >= target_command.target_phase_start[0]) & (phase <= target_command.target_phase_end[0])
+
+    return reward * active.float() * correct_motion.float()
