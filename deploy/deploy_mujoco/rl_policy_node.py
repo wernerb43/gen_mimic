@@ -53,7 +53,7 @@ class RLPolicyNode(Node):
         self.sim_time = 0.0
 
         # Load minimal config (only keys present in YAML)
-        self.initial_pose_index = 10
+        self.initial_pose_index = 1
         self.load_config()
         # Load policy if desired (may be TorchScript); it's optional — node works without it.
         self.load_policy()

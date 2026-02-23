@@ -297,13 +297,16 @@ class Controller(Node):
             # Select motion based on ball y position
             # Assuming 3 motions: left (negative y), center (y near 0), right (positive y)
             if self.motion_trajectories and len(self.motion_trajectories) >= 3:
+                ball_x = self.ball_position[0]
                 ball_y = self.ball_position[1]
-                if ball_y < -0.0:  # Ball is to the right
+                if ball_x < 0.3:  # Ball is far, use motion 0
                     self.which_motion = 0
-                elif ball_y > 0.3:  # Ball is to the left
+                elif ball_y < -0.0:  # Ball is to the right
                     self.which_motion = 1
-                else:  # Ball is in the center
+                elif ball_y > 0.3:  # Ball is to the left
                     self.which_motion = 2
+                else:  # Ball is in the center
+                    self.which_motion = 3
         else:
             self.get_logger().warning(f"Received ball position with insufficient data: {msg.data}")
 
@@ -857,7 +860,18 @@ class Controller(Node):
         return np.zeros(2 * self.num_joints, dtype=np.float32)
     
     def obs_command_target_position(self):
-        return self.ball_position.astype(np.float32)
+        ball_pos_body = self.ball_position.astype(np.float32)
+                # Add identity orientation
+        identity_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        ball_pos_body = np.concatenate([ball_pos_body, identity_quat]).astype(np.float32)
+        
+        return ball_pos_body.astype(np.float32)
+
+    def obs_command_conditioned_imitate(self):
+        # return command imitate plus command target position concatenated
+        cmd_imitate = self.obs_command_imitate()
+        cmd_target_pos = self.obs_command_target_position()
+        return np.concatenate([cmd_imitate, cmd_target_pos]).astype(np.float32)
 
     def obs_motion_anchor_pos_b(self):
         # Return motion anchor body position error in robot base frame

@@ -60,7 +60,7 @@ class RLPolicyNode(Node):
         # Load minimal config (only keys present in YAML)
         self.load_config()
         # Load policy if desired (may be TorchScript); it's optional — node works without it.
-        self.initial_pose_index = 3
+        self.initial_pose_index = 0
 
         self.load_policy()
         self.load_policy_metadata()
@@ -540,15 +540,29 @@ class RLPolicyNode(Node):
             ball_pos_relative_w = self.ball_position - self.robot_position
             q_inv = self._quat_conjugate(self.quat)
             ball_pos_body = self._quat_rotate(q_inv, ball_pos_relative_w)
+            ball_x_body = ball_pos_body[0]
             ball_y_body = ball_pos_body[1]
             
-            # Select motion based on ball y position
-            if ball_y_body < -0.3:
+        # which = torch.full((len(env_ids),), 0, dtype=torch.long, device=self.device) # throw when the x position is betwen 0 and 0.3
+
+        # # in negative y direction, use right catch
+        # which[(y_pos < 0.0) & (x_pos > 0.3)] = 1 # right catch 
+
+        # # in positive y direction use left catch
+        # which[(y_pos > 0.3) & (x_pos > 0.3)] = 2 # left catch 
+
+        # # in between use middle catch
+        # which[(y_pos > 0.0) & (y_pos < 0.3) & (x_pos > 0.3)] = 3 # middle catch
+
+            # Select motion based on ball position
+            if ball_x_body < 0.3:
                 self.which_motion = 0
-            elif ball_y_body > 0.3:
+            elif ball_y_body < 0.0:
                 self.which_motion = 1
-            else:
+            elif ball_y_body > 0.3:
                 self.which_motion = 2
+            else:
+                self.which_motion = 3
         
         # Handle motion playback: increment frame only if playback active
         if len(self.motion_trajectories) > 0 and self.which_motion < len(self.motion_trajectories) and self._play_motion_once:
@@ -670,8 +684,18 @@ class RLPolicyNode(Node):
         # 2. Rotate to body frame using inverse quaternion
         q_inv = self._quat_conjugate(self.quat)
         ball_pos_body = self._quat_rotate(q_inv, ball_pos_relative_w)
+
+        # Add identity orientation
+        identity_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        ball_pos_body = np.concatenate([ball_pos_body, identity_quat]).astype(np.float32)
         
         return ball_pos_body.astype(np.float32)
+
+    def obs_command_conditioned_imitate(self):
+        # return command imitate plus command target position concatenated
+        cmd_imitate = self.obs_command_imitate()
+        cmd_target_pos = self.obs_command_target_position()
+        return np.concatenate([cmd_imitate, cmd_target_pos]).astype(np.float32)
 
     def obs_motion_anchor_pos_b(self):
         # Return motion anchor body position error in robot base frame
@@ -805,6 +829,7 @@ class RLPolicyNode(Node):
                 if rlist:
                     ch = sys.stdin.read(1)
                     if ch.lower() == 'p':
+                        print(self.which_motion)
                         self._play_motion_once = True
                     elif ch.lower() == 'q':
                         break

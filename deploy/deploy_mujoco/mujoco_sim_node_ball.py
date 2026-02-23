@@ -53,9 +53,16 @@ class MujocoSimNode(Node):
         self._hold_printed = False
         self._released_printed = False
         
-        # Ball spawn configuration
+        ##################################################### Ball spawn configuration
         self.ball_spawn_time = 0.0  # Spawn ball at t=0.0s
-        self.ball_position = np.array([0.4, 0.2, 1.0])  # x, y, z position
+        self.ball_position = np.array([0.1, 0.0, 1.1])  # x, y, z position
+        #####################################################
+#         target_pos_range={
+        #     "x": (0.2, 0.4),
+        #     "y": (-0.3, 0.6),
+        #     "z": (0.1, 0.4),
+        # },
+
         self.ball_spawned = False
 
     # self.sim_time = 0.0
