@@ -99,6 +99,9 @@ class CommandsCfg:
         # Per-motion source and target link names
         source_link_names=["left_palm_link", "left_palm_link", "left_palm_link", "left_palm_link"],
         target_link_names=[None, None, None, None],  # None means sample static position
+        # source_link_names=["left_palm_link"],
+        # target_link_names=[None],
+
         # Per-motion target position ranges
         target_pos_ranges=[
             {"x": (0.2, 0.4), "y": (-0.3, 0.6), "z": (0.1, 0.4)},  # Throw - no target position tracking
@@ -291,11 +294,6 @@ class RewardsCfg:
             "threshold": 1.0,
         },
     )
-    # throw_position_reward = RewTerm(
-    #     func=mdp.multi_motion_target_position_error_exp,
-    #     weight=20.0,
-    #     params={"target_command_name": "multi_target_motion", "motion_command_name": "multi_target_motion", "std": 0.5, "motion_to_reward": 0},
-    # )
 
     right_catch_position_reward = RewTerm(
         func=mdp.multi_motion_target_position_error_exp,

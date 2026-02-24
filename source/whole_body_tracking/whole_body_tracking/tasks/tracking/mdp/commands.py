@@ -1377,8 +1377,6 @@ class MultiTargetConditionedMotionCommand(CommandTerm):
             self.robot.find_bodies(self.cfg.body_names, preserve_order=True)[0], dtype=torch.long, device=self.device
         )
 
-        # NOTE: command_manager is not available during construction.
-        # If you need to reference another command term, resolve it lazily after managers are initialized.
         self.env = env
 
         # Create motion data structures with per-motion parameters
@@ -1432,6 +1430,7 @@ class MultiTargetConditionedMotionCommand(CommandTerm):
         self.target_phase_start = torch.zeros(self.num_envs, device=self.device)
         self.target_phase_end = torch.zeros(self.num_envs, device=self.device)
 
+        # Adaptive sampling per motion
         self.bin_counts = [int(self.motion_loaders[i].time_step_total // (1 / (env.cfg.decimation * env.cfg.sim.dt))) + 1 for i in range(len(self.motion_loaders))]
         self.bin_failed_counts = [torch.zeros(self.bin_counts[i], dtype=torch.float, device=self.device) for i in range(len(self.motion_loaders))]
         self._current_bin_failed = [torch.zeros(self.bin_counts[i], dtype=torch.float, device=self.device) for i in range(len(self.motion_loaders))]
@@ -1441,6 +1440,7 @@ class MultiTargetConditionedMotionCommand(CommandTerm):
         )
         self.kernel = self.kernel / self.kernel.sum()
 
+        # Between motion pausing
         self.between_motion_pause_length = 1.0
         self.between_motion_pause_time = torch.zeros(self.num_envs, device=self.device)
 
@@ -1487,7 +1487,11 @@ class MultiTargetConditionedMotionCommand(CommandTerm):
         # Transform target orientation from world frame to body frame
         self.target_orientation_b = quat_mul(anchor_quat_inv, self.target_orientation_w)
 
-        return torch.cat([self.joint_pos, self.joint_vel, self.target_position_b, self.target_orientation_b], dim=1)
+        command_observation = torch.cat([self.joint_pos, self.joint_vel, self.target_position_b, self.target_orientation_b], dim=1)
+        # command_observation = torch.cat([self.joint_pos, self.joint_vel], dim=1)
+
+        # print("Command observation:", command_observation)
+        return command_observation
     
     @property
     def joint_pos(self) -> torch.Tensor:

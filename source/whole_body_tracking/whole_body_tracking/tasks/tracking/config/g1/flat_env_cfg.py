@@ -82,18 +82,6 @@ class G1MultiCatchingFlatEnvCfg(MultiCatchingEnvCfg):
             "right_elbow_link",
             "right_wrist_yaw_link",
         ]
-        # self.commands.multi_target_motion.source_link_names = [
-        #     "left_palm_link",
-        #     "left_palm_link",
-        #     "left_palm_link",
-        #     "left_palm_link",
-        # ]
-        # self.commands.multi_target_motion.source_link_name = "right_palm_link"
-
-
-
-
-
 
 @configclass
 class G1CatchingFlatEnvCfg(CatchingEnvCfg):
