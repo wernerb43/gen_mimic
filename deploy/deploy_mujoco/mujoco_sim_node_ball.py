@@ -58,7 +58,7 @@ class MujocoSimNode(Node):
         
         ##################################################### Ball spawn configuration
         self.ball_spawn_time = 0.0  # Spawn ball at t=0.0s
-        self.ball_position = np.array([0.21, 0.0, 1.1])  # x, y, z position
+        self.ball_position = np.array([0.4, 0.0, 1.1])  # x, y, z position
         self.ball_orientation = np.array([1.0, 0.0, 0.0, 0.0])  # identity quaternion (w, x, y, z)
         #####################################################
 #         target_pos_range={

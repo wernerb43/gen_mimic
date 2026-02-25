@@ -64,7 +64,7 @@ class RLPolicyNode(Node):
         # Load minimal config (only keys present in YAML)
         self.load_config()
         # Load policy if desired (may be TorchScript); it's optional — node works without it.
-        self.initial_pose_index = 1
+        self.initial_pose_index = 0
 
         self.load_policy()
         self.load_policy_metadata()
@@ -655,7 +655,7 @@ class RLPolicyNode(Node):
         return out
 
 
-    def obs_command(self):
+    def obs_command_imitate(self):
         # Return motion trajectory command: [joint_pos (motion), joint_vel (motion)]
         # This is the desired joint configuration and velocities from the motion being replayed
         # Size: 2 * num_joints (e.g., 58 for 29-DOF robot)
@@ -689,11 +689,11 @@ class RLPolicyNode(Node):
         # return command imitate plus command target position concatenated
         cmd_imitate = self.obs_command_imitate()
         cmd_target_pos = self.obs_command_target_position()
-        return cmd_imitate
+        # return cmd_imitate
 
         # print("cmd_imitate", cmd_imitate)
         # print("cmd_target_pos", cmd_target_pos)
-        # return np.concatenate([cmd_imitate, cmd_target_pos]).astype(np.float32)
+        return np.concatenate([cmd_imitate, cmd_target_pos]).astype(np.float32)
 
     def obs_motion_anchor_pos_b(self):
         # Return motion anchor body position error in robot base frame
@@ -836,17 +836,17 @@ class RLPolicyNode(Node):
                         ball_x_body = ball_pos_body[0]
                         ball_y_body = ball_pos_body[1]
 
-                        self.which_motion = 0  # default to idle
-                        # print(f"Ball position in body frame: x={ball_x_body:.3f}, y={ball_y_body:.3f}", flush=True)
-                        # if ball_x_body < 0.3:
-                        #     self.which_motion = 0
-                        # elif ball_y_body < 0.0:
-                        #     self.which_motion = 1
-                        # elif ball_y_body > 0.3:
-                        #     self.which_motion = 2
-                        # else:
-                        #     self.which_motion = 3
-                        # print(self.which_motion)
+                        # self.which_motion = 0  # default to idle
+                        print(f"Ball position in body frame: x={ball_x_body:.3f}, y={ball_y_body:.3f}", flush=True)
+                        if ball_x_body < 0.3:
+                            self.which_motion = 0
+                        elif ball_y_body < 0.0:
+                            self.which_motion = 1
+                        elif ball_y_body > 0.3:
+                            self.which_motion = 2
+                        else:
+                            self.which_motion = 3
+                        print(self.which_motion)
                         self._play_motion_once = True
                     elif ch.lower() == 'q':
                         break
