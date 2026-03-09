@@ -19,7 +19,7 @@ try:
 except Exception:
     ort = None
 from rclpy.node import Node
-from std_msgs.msg import Float32MultiArray, Float64
+from std_msgs.msg import Float32MultiArray, Float64, Bool
 
 import xml.etree.ElementTree as ET
 
@@ -63,6 +63,7 @@ class RLPolicyNode(Node):
 
         self.throw_ball_pub = self.create_publisher(Float32MultiArray, "throw_ball_command", 10)
         self.reset_ball_pub = self.create_publisher(Float32MultiArray, "reset_ball_command", 10)
+        self.motion_in_progress_pub = self.create_publisher(Bool, "motion_in_progress", 10)
 
         # Load minimal config (only keys present in YAML)
         self.load_config()
@@ -551,6 +552,11 @@ class RLPolicyNode(Node):
                     self.motion_frame_idx = self.initial_pose_index
                     self._play_motion_once = False
         
+        # publish the motion_in_progress flag based on whether we're actively playing a motion
+        motion_in_progress = Bool()
+        motion_in_progress.data = self._play_motion_once
+        self.motion_in_progress_pub.publish(motion_in_progress)
+        
         if hasattr(self, "onnx_sess") and self.onnx_sess is not None:
             try:
                 out0 = self._run_onnx_inference()  # numpy ndarray
@@ -610,6 +616,7 @@ class RLPolicyNode(Node):
 
     def ball_position_callback(self, msg):
         received = np.array(msg.data, dtype=np.float32)
+        #expects in world coordinates
 
         if len(received) == 3:
             self.ball_position = np.array(received, dtype=np.float32)
@@ -617,6 +624,7 @@ class RLPolicyNode(Node):
         ball_pos_relative_w = self.ball_position - self.robot_position
         q_inv = self._quat_conjugate(self.quat)
         ball_pos_body = self._quat_rotate(q_inv, ball_pos_relative_w)
+        
         ball_x_body = ball_pos_body[0]
         ball_y_body = ball_pos_body[1]
 

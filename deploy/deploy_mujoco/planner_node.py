@@ -1,7 +1,7 @@
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32MultiArray, Float64
+from std_msgs.msg import Float32MultiArray, Float64, Bool
 
 GRAVITY = 9.81  # m/s^2
 NUM_JOINTS = 29
@@ -22,6 +22,14 @@ class Planner(Node):
         self.ball_position_sub = self.create_subscription(
             Float32MultiArray, "ball_position", self.ball_position_callback, 10
         )
+        self.robot_position_sub = self.create_subscription(
+            Float32MultiArray, "robot_position", self.robot_position_callback, 10
+        )
+
+        self.motion_in_progress_sub = self.create_subscription(
+            Bool, "motion_in_progress", self.motion_in_progress_callback, 10
+        )
+
         self.sensor_sub = self.create_subscription(
             Float32MultiArray, "sensor_data", self.sensor_callback, 10
         )
@@ -43,6 +51,8 @@ class Planner(Node):
         self.prev_ball_pos = None
         self.prev_time = None
         self.sim_time = 0.0
+
+        self.robot_position = np.array([0.0, 0.0, 0.0], dtype=np.float32)  # x y z
         self.robot_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)  # w,x,y,z
         self.default_ball_position = np.array([0.0, 0.0, 1.1], dtype=np.float32)  # fallback if no data yet
 
@@ -50,12 +60,17 @@ class Planner(Node):
         self.intercept_x = 0.3
 
         # the time it takes between the start of a motion and the 'catch' of the motion (ideally this is fixed for)
-        self.motion_time = 0.6
+        self.motion_time = 1.0
 
         # Estimation at 50 Hz (matches control_dt = 0.02)
         self.timer = self.create_timer(0.02, self.estimate_step)
 
         self.play_motion = False
+        self.motion_in_progress = False
+
+        self.last_intercept_location = np.copy(self.default_ball_position)
+
+        
 
     # ------------------------------------------------------------------ callbacks
 
@@ -69,6 +84,15 @@ class Planner(Node):
         # sensor_data layout: [qj(29), dqj(29), quat(4), omega(3)]
         if len(received) >= 2 * NUM_JOINTS + 4:
             self.robot_quat = received[2 * NUM_JOINTS : 2 * NUM_JOINTS + 4].copy()
+
+    def robot_position_callback(self, msg):
+        received = np.array(msg.data, dtype=np.float32)
+        if len(received) == 3:
+            self.robot_position = received.copy()
+
+    def motion_in_progress_callback(self, msg):
+        self.motion_in_progress = msg.data
+
 
     def time_callback(self, msg):
         self.sim_time = msg.data
@@ -112,21 +136,25 @@ class Planner(Node):
         self.prev_time = self.sim_time
 
         # --- solve for plane intersection ---
-        # Robot forward direction (x-axis of body frame) in world frame
-        forward = self._quat_rotate_vec(
-            self.robot_quat, np.array([1.0, 0.0, 0.0], dtype=np.float32)
-        )
-
-        # Gravity vector in world frame
+        # Transform ball position and velocity from world frame to robot body frame
+        ball_pos_body = self._world_to_body(self.ball_pos)
+        ball_vel_body = self._world_to_body_vec(ball_vel)
+        
+        # Gravity vector in robot body frame
         gravity_w = np.array([0.0, 0.0, -GRAVITY], dtype=np.float32)
+        gravity_body = self._world_to_body_vec(gravity_w)
+
+        # Forward direction in body frame is just the x-axis
+        forward = np.array([1.0, 0.0, 0.0], dtype=np.float32)
 
         # Ballistic trajectory: p(t) = p0 + v0*t + 0.5*g*t^2
-        # Plane condition:  forward . (p(t) - robot_pos) = intercept_x
+        # Plane condition:  forward . p(t) = intercept_x
         # => A*t^2 + B*t + C = 0
-        p0_rel = self.ball_pos
-        A = 0.5 * np.dot(forward, gravity_w)
-        B = np.dot(forward, ball_vel)
-        C = np.dot(forward, p0_rel) - self.intercept_x
+        A = 0.5 * np.dot(forward, gravity_body)
+        B = np.dot(forward, ball_vel_body)
+        C = np.dot(forward, ball_pos_body) - self.intercept_x
+        # print(f"Planner: A={A:.4f}, B={B:.4f}, C={C:.4f}") #TODO why is this quadratic?
+        # print("forward:", forward)
 
         t_intercept = self._solve_quadratic_smallest_positive(A, B, C)
 
@@ -135,30 +163,54 @@ class Planner(Node):
         play_msg = Float32MultiArray()
         
         if t_intercept is None or t_intercept < 0:
-            # No valid intercept or ball has passed - publish default position
-            default_body = self.default_ball_position
-            msg.data = [float(default_body[0]), float(default_body[1]), float(default_body[2])]
+            # No valid intercept or ball has passed - publish default position (in world frame)
+            default_world = self.default_ball_position
+            msg.data = [float(default_world[0]), float(default_world[1]), float(default_world[2])]
             play_msg.data = [0.0]
-        elif t_intercept < self.motion_time:
-            # Ball is approaching and will intercept soon - publish intercept estimate
-            intercept_world = (
-                self.ball_pos
-                + ball_vel * t_intercept
-                + 0.5 * gravity_w * t_intercept ** 2
+        elif t_intercept < self.motion_time:  
+            print(f"Valid intercept in {t_intercept:.2f} seconds - publishing intercept location and play command")
+            # Ball is approaching and will intercept soon - compute intercept in body frame, then transform to world
+            intercept_body = (
+                ball_pos_body
+                + ball_vel_body * t_intercept
+                + 0.5 * gravity_body * t_intercept ** 2
             )
-            intercept_body = intercept_world  # No need to transform if using world coordinates
-            msg.data = [float(intercept_body[0]), float(intercept_body[1]), float(intercept_body[2])]
+            # Transform intercept from body frame to world frame
+            intercept_world = self._body_to_world(intercept_body)
+            msg.data = [float(intercept_world[0]), float(intercept_world[1]), float(intercept_world[2])]
+            play_msg.data = [1.0]
+            self.last_intercept_location = intercept_world
+        elif self.motion_in_progress:
+            # motion is in progress, but the ball has passed, so we should publish the last intercept location to try to complete the motion
+            intercept_world = self.last_intercept_location
+            msg.data = [float(intercept_world[0]), float(intercept_world[1]), float(intercept_world[2])]
             play_msg.data = [1.0]
         else:
-            # Ball is too far away - publish default position
-            default_body = self.default_ball_position
-            msg.data = [float(default_body[0]), float(default_body[1]), float(default_body[2])]
+            # Ball is too far away - publish default position (in world frame)
+            default_world = self.default_ball_position
+            msg.data = [float(default_world[0]), float(default_world[1]), float(default_world[2])]
             play_msg.data = [0.0]
         
         self.estimate_pub.publish(msg)
         self.play_motion_pub.publish(play_msg)
 
     # ------------------------------------------------------------------ helpers
+    def _world_to_body(self, point_world):
+        """Transform a point from world frame to robot body frame."""
+        point_relative = point_world - self.robot_position
+        q_inv = self._quat_conjugate(self.robot_quat)
+        return self._quat_rotate_vec(q_inv, point_relative)
+    
+    def _world_to_body_vec(self, vec_world):
+        """Transform a vector (not a point) from world frame to robot body frame."""
+        q_inv = self._quat_conjugate(self.robot_quat)
+        return self._quat_rotate_vec(q_inv, vec_world)
+    
+    def _body_to_world(self, point_body):
+        """Transform a point from robot body frame to world frame."""
+        point_world_relative = self._quat_rotate_vec(self.robot_quat, point_body)
+        return point_world_relative + self.robot_position
+    
     @staticmethod
     def _quat_conjugate(q):
         return np.array([q[0], -q[1], -q[2], -q[3]], dtype=np.float32)
@@ -201,6 +253,7 @@ class Planner(Node):
         sqrt_d = np.sqrt(discriminant)
         t1 = (-B - sqrt_d) / (2 * A)
         t2 = (-B + sqrt_d) / (2 * A)
+        # print(f"quadratic solutions: t1={t1:.4f}, t2={t2:.4f}")
 
         candidates = [t for t in (t1, t2) if t > 1e-6]
         return min(candidates) if candidates else None
