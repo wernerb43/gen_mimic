@@ -9,11 +9,11 @@ plot_feet: False
 # For multiple motions, use motion_npz_paths (list):
 motion_npz_paths:
     # - "/home/blake/gen_mimic/artifacts/handoff_4_palm_link:v0/motion.npz"
-    - "/home/blake/gen_mimic/artifacts/throw_combine_2:v0/motion.npz"
+    # - "/home/blake/gen_mimic/artifacts/throw_combine_2:v0/motion.npz"
     - "/home/blake/gen_mimic/artifacts/right_catch_combine_2:v0/motion.npz"
     - "/home/blake/gen_mimic/artifacts/left_catch_combine_2:v0/motion.npz"
     - "/home/blake/gen_mimic/artifacts/stand_catch_combine_2:v0/motion.npz"
-    - "/home/blake/gen_mimic/artifacts/handoff_combine_1:v0/motion.npz"
+    # - "/home/blake/gen_mimic/artifacts/handoff_combine_1:v0/motion.npz"
     # - "/home/blake/gen_mimic/artifacts/catch_right_step_1:v0/motion.npz"
     # - "/home/blake/gen_mimic/artifacts/catch_left_step_1:v0/motion.npz"
     # - "/home/blake/gen_mimic/artifacts/stand_catch_1:v0/motion.npz"

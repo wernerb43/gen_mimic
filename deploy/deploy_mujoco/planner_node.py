@@ -67,6 +67,7 @@ class Planner(Node):
 
         self.play_motion = False
         self.motion_in_progress = False
+        self.motion_triggered = False
 
         self.last_intercept_location = np.copy(self.default_ball_position)
 
@@ -167,8 +168,7 @@ class Planner(Node):
             default_world = self.default_ball_position
             msg.data = [float(default_world[0]), float(default_world[1]), float(default_world[2])]
             play_msg.data = [0.0]
-        elif t_intercept < self.motion_time:  
-            print(f"Valid intercept in {t_intercept:.2f} seconds - publishing intercept location and play command")
+        elif t_intercept < self.motion_time:
             # Ball is approaching and will intercept soon - compute intercept in body frame, then transform to world
             intercept_body = (
                 ball_pos_body
@@ -178,18 +178,24 @@ class Planner(Node):
             # Transform intercept from body frame to world frame
             intercept_world = self._body_to_world(intercept_body)
             msg.data = [float(intercept_world[0]), float(intercept_world[1]), float(intercept_world[2])]
-            play_msg.data = [1.0]
             self.last_intercept_location = intercept_world
+            if not self.motion_triggered:
+                print(f"Valid intercept in {t_intercept:.2f} seconds - triggering catch motion")
+                play_msg.data = [1.0]
+                self.motion_triggered = True
+            else:
+                play_msg.data = [0.0]
         elif self.motion_in_progress:
             # motion is in progress, but the ball has passed, so we should publish the last intercept location to try to complete the motion
             intercept_world = self.last_intercept_location
             msg.data = [float(intercept_world[0]), float(intercept_world[1]), float(intercept_world[2])]
-            play_msg.data = [1.0]
+            play_msg.data = [0.0]
         else:
-            # Ball is too far away - publish default position (in world frame)
+            # Ball is too far away or motion completed - publish default position and reset trigger
             default_world = self.default_ball_position
             msg.data = [float(default_world[0]), float(default_world[1]), float(default_world[2])]
             play_msg.data = [0.0]
+            self.motion_triggered = False
         
         self.estimate_pub.publish(msg)
         self.play_motion_pub.publish(play_msg)

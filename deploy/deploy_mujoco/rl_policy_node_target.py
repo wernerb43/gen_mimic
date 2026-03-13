@@ -820,21 +820,21 @@ class RLPolicyNode(Node):
 
                         # self.which_motion = 0  # default to idle
                         print(f"Ball position in body frame: x={ball_x_body:.3f}, y={ball_y_body:.3f}", flush=True)
-                        if ball_x_body == 0.0:
+                        # if ball_x_body == 0.0:
+                        #     self.which_motion = 0
+                        if ball_y_body < 0.0:
                             self.which_motion = 0
-                        elif ball_y_body < 0.0:
-                            self.which_motion = 1
                         elif ball_y_body > 0.3:
-                            self.which_motion = 2
+                            self.which_motion = 1
                         else:
-                            self.which_motion = 3
+                            self.which_motion = 2
                         # self.which_motion = 4
                         print(self.which_motion)
                         self._play_motion_once = True
                     if ch.lower() == 't':
-                        # this commands the sim to release and throw the ball
+                        # this commands the sim to randomize the ball target position
                         self.throw_ball_pub.publish(Float32MultiArray(data=[1.0]))
-                        print("Throw command sent")
+                        print("Randomize target command sent")
                     if ch.lower() == 'r':
                         # this commands the sim to reset the ball to its initial position
                         self.reset_ball_pub.publish(Float32MultiArray(data=[1.0]))

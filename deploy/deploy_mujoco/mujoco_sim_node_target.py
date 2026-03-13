@@ -59,26 +59,18 @@ class MujocoSimNode(Node):
         ##################################################### Ball spawn configuration
         self.ball_spawn_time = 0.0  # Spawn ball at t=0.0s
         self.ball_position = np.array([0.35, -0.2, 1.1])  # x, y, z position
-        self.ball_velocity = np.array([-5.0, 0.0, 4.0])  # initial velocity
-        self.ball_orientation = np.array([1.0, 0.0, 0.0, 0.0])  # identity quaternion (w, x, y, z)1
+        self.ball_orientation = np.array([1.0, 0.0, 0.0, 0.0])  # identity quaternion (w, x, y, z)
+
+        # Randomization ranges for target position (relative to robot)
+        self.target_x_range = (0.3, 0.35)   # forward distance from robot
+        self.target_y_range = (-0.4, 0.4)  # lateral range
+        self.target_z_range = (0.9, 1.2)   # height range
         #####################################################
 
         self.ball_spawned = False
-        self.ball_thrown = False
-        self.ball_stuck = False
-        self.ball_stuck_offset = np.zeros(3)  # offset from left hand body to ball when caught
-        self.ball_catch_radius = 0.12  # distance threshold for catching (hand radius + ball radius)
 
-        # Find left hand body id for catch detection
-        try:
-            self.left_hand_body_id = mujoco.mj_name2id(self.m, mujoco.mjtObj.mjOBJ_BODY, "left_wrist_yaw_link")
-            self.get_logger().info(f"Left hand body found: id={self.left_hand_body_id}")
-        except Exception:
-            self.left_hand_body_id = None
-            self.get_logger().warning("left_wrist_yaw_link body not found")
-
-        # Subscribe to ros commands for throwing and resetting the ball
-        # (these are published by the RL policy node when user presses 't' or 'r')
+        # Subscribe to ros commands for randomizing and resetting the ball target
+        # (published by the RL policy node when user presses 't' or 'r')
         self.throw_ball_sub = self.create_subscription(
             Float32MultiArray, "throw_ball_command", self.throw_ball_callback, 10
         )
@@ -137,15 +129,22 @@ class MujocoSimNode(Node):
 
 
     def throw_ball_callback(self, msg):
+        """Randomize ball position within target range (relative to robot) and hold it in place."""
         if self.ball_body_id is None:
             return
-        velocity = np.array(msg.data, dtype=np.float64) if len(msg.data) >= 3 else (self.ball_velocity + np.random.normal(0, 0.3, size=3))
-        velocity = velocity[:3]
-        self.m.body_gravcomp[self.ball_body_id] = 0.0
-        self.d.qvel[self.ball_joint_qvel_adr:self.ball_joint_qvel_adr + 3] = velocity
-        self.d.qvel[self.ball_joint_qvel_adr + 3:self.ball_joint_qvel_adr + 6] = 0.0
-        self.ball_thrown = True
-        print(f"Throw ball command received. Launch velocity: {velocity}")
+        # Randomize position relative to robot
+        robot_pos = self.d.xpos[1]  # robot base position
+        x = robot_pos[0] + np.random.uniform(*self.target_x_range)
+        y = robot_pos[1] + np.random.uniform(*self.target_y_range)
+        z = np.random.uniform(*self.target_z_range)  # absolute height
+        new_pos = np.array([x, y, z])
+        # Place ball at randomized position with gravity compensation (static target)
+        self.m.body_gravcomp[self.ball_body_id] = 1.0
+        self.d.qpos[self.ball_joint_qpos_adr:self.ball_joint_qpos_adr + 3] = new_pos
+        self.d.qpos[self.ball_joint_qpos_adr + 3:self.ball_joint_qpos_adr + 7] = [1, 0, 0, 0]
+        self.d.qvel[self.ball_joint_qvel_adr:self.ball_joint_qvel_adr + 6] = 0.0
+        self.ball_spawned = True
+        print(f"Target randomized at position: [{x:.3f}, {y:.3f}, {z:.3f}]")
 
     def reset_ball_callback(self, msg):
         if self.ball_body_id is None:
@@ -154,8 +153,6 @@ class MujocoSimNode(Node):
         self.d.qpos[self.ball_joint_qpos_adr:self.ball_joint_qpos_adr + 3] = self.ball_position
         self.d.qpos[self.ball_joint_qpos_adr + 3:self.ball_joint_qpos_adr + 7] = [1, 0, 0, 0]
         self.d.qvel[self.ball_joint_qvel_adr:self.ball_joint_qvel_adr + 6] = 0.0
-        self.ball_thrown = False
-        self.ball_stuck = False
         self.ball_spawned = True
         print("Reset ball command received. Ball reset to initial position with gravity compensation on.")
 
@@ -219,29 +216,6 @@ class MujocoSimNode(Node):
         self.d.ctrl[: self.num_joints] = self.target_dof_pos
 
         mujoco.mj_step(self.m, self.d)
-
-        # Ball catching: detect proximity and stick ball to left hand
-        if self.ball_body_id is not None and self.left_hand_body_id is not None and self.ball_thrown:
-            if self.ball_stuck:
-                # Keep ball attached to hand: set ball position to hand pos + offset, zero velocity
-                hand_pos = self.d.xpos[self.left_hand_body_id]
-                hand_quat = self.d.xquat[self.left_hand_body_id]
-                # Rotate the offset by current hand orientation
-                stuck_pos = hand_pos + self._quat_rotate(hand_quat, self.ball_stuck_offset)
-                self.d.qpos[self.ball_joint_qpos_adr:self.ball_joint_qpos_adr + 3] = stuck_pos
-                self.d.qvel[self.ball_joint_qvel_adr:self.ball_joint_qvel_adr + 6] = 0.0
-            else:
-                # Check distance between ball and left hand
-                ball_pos = self.d.xpos[self.ball_body_id]
-                hand_pos = self.d.xpos[self.left_hand_body_id]
-                dist = np.linalg.norm(ball_pos - hand_pos)
-                if dist < self.ball_catch_radius:
-                    self.ball_stuck = True
-                    # Store offset in hand-local frame
-                    hand_quat = self.d.xquat[self.left_hand_body_id]
-                    self.ball_stuck_offset = self._quat_rotate_inv(hand_quat, ball_pos - hand_pos)
-                    self.d.qvel[self.ball_joint_qvel_adr:self.ball_joint_qvel_adr + 6] = 0.0
-                    print(f"Ball caught by left hand! dist={dist:.3f}")
 
         # Prepare sensor data
         qj = self.d.sensordata[: self.num_joints]  # [self.joint_ids]
@@ -310,24 +284,6 @@ class MujocoSimNode(Node):
             self.viewer.sync()
             self._last_viewer_sync_time = time.time()
         # --- end synchronization ---
-
-
-    @staticmethod
-    def _quat_rotate(q, v):
-        """Rotate vector v by quaternion q (w, x, y, z)."""
-        w, x, y, z = q
-        # v as quaternion: (0, vx, vy, vz)
-        # result = q * v_quat * q_conj
-        t = 2.0 * np.cross(np.array([x, y, z]), v)
-        return v + w * t + np.cross(np.array([x, y, z]), t)
-
-    @staticmethod
-    def _quat_rotate_inv(q, v):
-        """Rotate vector v by the inverse of quaternion q (w, x, y, z)."""
-        w, x, y, z = q
-        # Conjugate: (w, -x, -y, -z)
-        t = 2.0 * np.cross(np.array([-x, -y, -z]), v)
-        return v + w * t + np.cross(np.array([-x, -y, -z]), t)
 
 
 def main(args=None):

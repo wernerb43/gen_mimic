@@ -34,13 +34,13 @@ def main():
 
     sim_cmd = [
         sys.executable,
-        os.path.join(os.path.dirname(__file__), "mujoco_sim_node_ball.py"),
+        os.path.join(os.path.dirname(__file__), "mujoco_sim_node_target.py"),
         "--config",
         args.config,
     ]
     policy_cmd_29 = [
         sys.executable,
-        os.path.join(os.path.dirname(__file__), "rl_policy_node_ball.py"),
+        os.path.join(os.path.dirname(__file__), "rl_policy_node_target.py"),
         "--config",
         args.config,
     ]
