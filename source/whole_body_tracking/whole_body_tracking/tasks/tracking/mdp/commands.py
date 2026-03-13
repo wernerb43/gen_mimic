@@ -1697,7 +1697,7 @@ class MultiTargetConditionedMotionCommand(CommandTerm):
         # print('calling resample command with env_ids:', env_ids)
         # Choose which motion to track for each env uniformly at random
         self.which_motion[env_ids] = torch.randint(0, len(self.motion_loaders), (len(env_ids),), device=self.device)
-        # self.which_motion[env_ids] = torch.ones(len(env_ids), dtype=torch.long, device=self.device)
+        # self.which_motion[env_ids] = torch.zeros(len(env_ids), dtype=torch.long, device=self.device)
         
         # Then do adaptive sampling based on chosen motions
         self._adaptive_sampling(env_ids)
