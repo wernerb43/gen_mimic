@@ -1390,7 +1390,8 @@ class MultiTargetConditionedMotionCommand(CommandTerm):
                 motion_file=motion_file,
                 source_link=self.cfg.source_link_names[i],
                 target_link=self.cfg.target_link_names[i] if i < len(self.cfg.target_link_names) else None,
-                target_pos_range=self.cfg.target_pos_ranges[i] if i < len(self.cfg.target_pos_ranges) else {"x": (0.0, 0.0), "y": (0.0, 0.0), "z": (0.0, 0.0)},
+                target_pos_mean=self.cfg.target_pos_means[i] if i < len(self.cfg.target_pos_means) else {"x": 0.0, "y": 0.0, "z": 0.0},
+                target_pos_std=self.cfg.target_pos_stds[i] if i < len(self.cfg.target_pos_stds) else {"x": 0.0, "y": 0.0, "z": 0.0},
                 target_euler_angle_range=self.cfg.target_euler_angle_ranges[i] if i < len(self.cfg.target_euler_angle_ranges) else {"roll": (0.0, 0.0), "pitch": (0.0, 0.0), "yaw": (0.0, 0.0)},
                 target_pos_offset=self.cfg.target_pos_offsets[i] if i < len(self.cfg.target_pos_offsets) else (0.0, 0.0, 0.0),
                 target_euler_angle_offset=self.cfg.target_euler_angle_offsets[i] if i < len(self.cfg.target_euler_angle_offsets) else (0.0, 0.0, 0.0),
@@ -1410,6 +1411,10 @@ class MultiTargetConditionedMotionCommand(CommandTerm):
                 self.target_body_indices.append(None)
         
         self.which_motion = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+
+        # Scale factor for target position Gaussian std (0 = no variance, 1 = full variance).
+        # The curriculum modifies this over training.
+        self.target_pos_std_scale = 0.0
 
         self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.body_pos_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 3, device=self.device)
@@ -1763,10 +1768,12 @@ class MultiTargetConditionedMotionCommand(CommandTerm):
                     offset_quat_expanded
                 )
             else:
-                # Sample random target position within specified range
-                pos_range_list = [motion_cfg.target_pos_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z"]]
-                pos_ranges = torch.tensor(pos_range_list, device=self.device)
-                rand_samples = sample_uniform(pos_ranges[:, 0], pos_ranges[:, 1], (motion_mask.sum().item(), 3), device=self.device)
+                # Sample random target position from Gaussian around nominal mean
+                pos_mean = torch.tensor([motion_cfg.target_pos_mean.get(key, 0.0) for key in ["x", "y", "z"]], device=self.device)
+                pos_std = torch.tensor([motion_cfg.target_pos_std.get(key, 0.0) for key in ["x", "y", "z"]], device=self.device)
+                current_std = pos_std * self.target_pos_std_scale
+                n_samples = motion_mask.sum().item()
+                rand_samples = pos_mean.unsqueeze(0) + torch.randn(n_samples, 3, device=self.device) * current_std.unsqueeze(0)
                 
                 # Sample target orientation within specified range
                 euler_range_list = [motion_cfg.target_euler_angle_range.get(key, (0.0, 0.0)) for key in ["roll", "pitch", "yaw"]]
@@ -1903,11 +1910,12 @@ class MultiTargetConditionedMotionCommand(CommandTerm):
 
 class Motion():
 
-    def __init__(self, motion_file, source_link, target_link, target_pos_range, target_euler_angle_range, target_pos_offset, target_euler_angle_offset, target_phase_start_range, target_phase_end_range):
+    def __init__(self, motion_file, source_link, target_link, target_pos_mean, target_pos_std, target_euler_angle_range, target_pos_offset, target_euler_angle_offset, target_phase_start_range, target_phase_end_range):
         self.motion_file = motion_file
         self.source_link = source_link
         self.target_link = target_link
-        self.target_pos_range = target_pos_range
+        self.target_pos_mean = target_pos_mean
+        self.target_pos_std = target_pos_std
         self.target_euler_angle_range = target_euler_angle_range
         self.target_pos_offset = target_pos_offset
         self.target_euler_angle_offset = target_euler_angle_offset
@@ -1948,8 +1956,12 @@ class MultiTargetConditionedMotionCommandCfg(CommandTermCfg):
     target_link_names: list[str] = []
     """Name of of the body that we want the other part of the body to go to (eg for handoff we want to track the other hand)"""
 
-    target_pos_ranges: list[tuple[float, float, float]] = []
-    """List of target position ranges (x, y, z) in meters for each motion"""
+    target_pos_means: list[dict[str, float]] = []
+    """List of nominal target positions {"x": ..., "y": ..., "z": ...} in meters for each motion."""
+
+    target_pos_stds: list[dict[str, float]] = []
+    """List of per-axis standard deviations {"x": ..., "y": ..., "z": ...} for Gaussian sampling of target positions for each motion.
+    These represent the final (maximum) standard deviations; the curriculum controls the current scale."""
 
     target_euler_angle_ranges: list[dict[str, tuple[float, float]]] = []
     """List of target orientation as euler angle ranges (x, y, z) in radians for each motion. Note: sampled quaternions will be normalized."""
