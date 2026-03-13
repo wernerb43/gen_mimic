@@ -17,15 +17,15 @@ def decay_imitation_reward_weights(
 ) -> dict[str, float]:
     """Hold imitation reward weights constant, then linearly decay them to zero.
 
-    Weights stay at their initial values for ``hold_steps``, then linearly decay
-    to zero over the next ``decay_steps``. Total steps to reach zero weight is
-    ``hold_steps + decay_steps``.
+    Weights stay at their initial values for ``hold_steps`` learning iterations,
+    then linearly decay to zero over the next ``decay_steps`` iterations. An
+    iteration is ``common_step_counter / num_envs``.
 
     Args:
         env: The learning environment.
         env_ids: Not used since all environments are affected.
-        hold_steps: Number of steps to hold initial weights before starting decay.
-        decay_steps: Number of steps over which to linearly decay weights to zero.
+        hold_steps: Number of iterations to hold initial weights before starting decay.
+        decay_steps: Number of iterations over which to linearly decay weights to zero.
         term_prefixes: Prefixes that identify which reward terms are imitation rewards.
 
     Returns:
@@ -43,12 +43,12 @@ def decay_imitation_reward_weights(
         reward_mgr._imitation_initial_weights = initial_weights
 
     initial_weights = reward_mgr._imitation_initial_weights
-    step = env.common_step_counter
+    iteration = env.common_step_counter / env.num_envs
 
-    if step <= hold_steps:
+    if iteration <= hold_steps:
         scale = 1.0
     else:
-        progress = min((step - hold_steps) / decay_steps, 1.0)
+        progress = min((iteration - hold_steps) / decay_steps, 1.0)
         scale = 1.0 - progress
 
     result: dict[str, float] = {}

@@ -257,3 +257,9 @@ def multi_motion_target_orientation_axis_alignment_error_exp(
 
     active = (phase >= command.target_phase_start) & (phase <= command.target_phase_end)
     return reward * active.float() * correct_motion.float()
+
+
+def action_rate_l2_clamped(env: ManagerBasedRLEnv, max_value: float = 1.0) -> torch.Tensor:
+    """Penalize the rate of change of actions using L2 squared kernel, clamped to a max value."""
+    raw = torch.sum(torch.square(env.action_manager.action - env.action_manager.prev_action), dim=1)
+    return torch.clamp(raw, min=-max_value, max=max_value)

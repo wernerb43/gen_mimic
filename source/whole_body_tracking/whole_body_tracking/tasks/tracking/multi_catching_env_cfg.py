@@ -284,7 +284,7 @@ class RewardsCfg:
         weight=1.0,
         params={"command_name": "multi_target_motion", "std": 3.14},
     )
-    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-1e-1)
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2_clamped, weight=-1e-1, params={"max_value": 3.0})
     joint_limit = RewTerm(
         func=mdp.joint_pos_limits,
         weight=-10.0,
@@ -416,11 +416,11 @@ class TerminationsCfg:
 class CurriculumCfg:
     """Curriculum terms for the MDP."""
 
-    # decay_imitation_rewards = CurrTerm(
-    #     func=mdp.decay_imitation_reward_weights,
-    #     params={"hold_steps": 5000, "decay_steps": 5000, "term_prefixes": ("motion_",)},
-    # )
-    pass
+    decay_imitation_rewards = CurrTerm(
+        func=mdp.decay_imitation_reward_weights,
+        params={"hold_steps": 5000, "decay_steps": 5000, "term_prefixes": ("motion_",)},
+    )
+    # pass
 
 ##
 # Environment configuration
