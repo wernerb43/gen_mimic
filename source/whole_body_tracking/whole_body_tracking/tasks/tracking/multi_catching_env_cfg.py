@@ -107,17 +107,17 @@ class CommandsCfg:
         # Per-motion nominal target positions (mean of Gaussian)
         target_pos_means=[
             # {"x": 0.0, "y": 0.0, "z": 0.0},  # Throw - no target position tracking
-            {"x": 0.3, "y": -0.15, "z": 0.2},  # Right catch
-            {"x": 0.3, "y": 0.45, "z": 0.2},   # Left catch
-            {"x": 0.3, "y": 0.15, "z": 0.2},   # Middle catch
+            {"x": 0.3, "y": -0.40, "z": 0.3},  # Right catch
+            {"x": 0.3, "y": 0.40, "z": 0.3},   # Left catch
+            {"x": 0.3, "y": -0.10, "z": 0.4},   # Middle catch
             # {"x": 0.0, "y": 0.0, "z": 0.0},  # Handoff
         ],
         # Per-motion target position standard deviations (max, scaled by curriculum)
         target_pos_stds=[
             # {"x": 0.0, "y": 0.0, "z": 0.0},  # Throw
-            {"x": 0.05, "y": 0.15, "z": 0.2},  # Right catch
-            {"x": 0.05, "y": 0.15, "z": 0.2},  # Left catch
-            {"x": 0.05, "y": 0.15, "z": 0.2},  # Middle catch
+            {"x": 0.05, "y": 0.2, "z": 0.1},  # Right catch
+            {"x": 0.05, "y": 0.2, "z": 0.1},  # Left catch
+            {"x": 0.05, "y": 0.2, "z": 0.1},  # Middle catch
             # {"x": 0.0, "y": 0.0, "z": 0.0},  # Handoff
         ],
         # Per-motion target orientation ranges
@@ -144,20 +144,20 @@ class CommandsCfg:
             (0.0, 0.0, 1.5708),  # Middle catch
             # (0.0, 3.1415, 0.0),  # Handoff
         ],
-        # Per-motion phase ranges
-        target_phase_start_ranges=[
-            # (0.0, 0.0),   # Throw
-            (0.433, 0.433), # Right catch
-            (0.356, 0.356), # Left catch
-            (0.345, 0.345), # Middle catch
-            # (0.45, 0.45), # Handoff       
+        # Per-motion phase windows
+        target_phase_starts=[
+            # 0.0,    # Throw
+            0.433,  # Right catch
+            0.356,  # Left catch
+            0.345,  # Middle catch
+            # 0.45,  # Handoff
         ],
-        target_phase_end_ranges=[
-            # (1.0, 1.0),   # Throw
-            (0.686, 0.686), # Right catch
-            (0.666, 0.666), # Left catch
-            (0.636, 0.636), # Middle catch
-            # (0.55, 0.55), # Handoff
+        target_phase_ends=[
+            # 1.0,    # Throw
+            0.686,  # Right catch
+            0.666,  # Left catch
+            0.636,  # Middle catch
+            # 0.55,  # Handoff
         ],
     )
 
@@ -291,7 +291,7 @@ class RewardsCfg:
         weight=1.0,
         params={"command_name": "multi_target_motion", "std": 3.14},
     )
-    action_rate_l2 = RewTerm(func=mdp.action_rate_l2_clamped, weight=-1e-1, params={"max_value": 3.0})
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2_clamped, weight=-1e-1, params={"max_value": 50.0})
     joint_limit = RewTerm(
         func=mdp.joint_pos_limits,
         weight=-10.0,
@@ -374,16 +374,16 @@ class CurriculumCfg:
         params={"hold_steps": 5000, "decay_steps": 5000, "term_prefixes": ("motion_",)},
     )
 
-    ramp_target_pos_variance = CurrTerm(
-        func=mdp.ramp_target_pos_variance,
-        params={
-            "command_name": "multi_target_motion",
-            "reward_term_name": "target_position_reward",
-            "reward_threshold": 0.7,
-            "scale_increment": 0.01,
-            "ema_alpha": 0.01,
-        },
-    )
+    # ramp_target_pos_variance = CurrTerm(
+    #     func=mdp.ramp_target_pos_variance,
+    #     params={
+    #         "command_name": "multi_target_motion",
+    #         "reward_term_name": "target_position_reward",
+    #         "reward_threshold": 0.7,
+    #         "scale_increment": 0.01,
+    #         "ema_alpha": 0.01,
+    #     },
+    # )
 
 ##
 # Environment configuration

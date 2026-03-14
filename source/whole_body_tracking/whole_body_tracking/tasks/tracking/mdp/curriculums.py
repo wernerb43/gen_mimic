@@ -67,9 +67,9 @@ def ramp_target_pos_variance(
     env_ids: Sequence[int],
     command_name: str,
     reward_term_name: str,
-    reward_threshold: float = 0.7,
-    scale_increment: float = 0.01,
-    ema_alpha: float = 0.01,
+    reward_threshold: float,
+    scale_increment: float,
+    ema_alpha: float,
 ) -> dict[str, float]:
     """Increase target position Gaussian std when the policy achieves high reward.
 

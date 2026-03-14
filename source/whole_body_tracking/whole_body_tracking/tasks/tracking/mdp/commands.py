@@ -1395,8 +1395,8 @@ class MultiTargetConditionedMotionCommand(CommandTerm):
                 target_euler_angle_range=self.cfg.target_euler_angle_ranges[i] if i < len(self.cfg.target_euler_angle_ranges) else {"roll": (0.0, 0.0), "pitch": (0.0, 0.0), "yaw": (0.0, 0.0)},
                 target_pos_offset=self.cfg.target_pos_offsets[i] if i < len(self.cfg.target_pos_offsets) else (0.0, 0.0, 0.0),
                 target_euler_angle_offset=self.cfg.target_euler_angle_offsets[i] if i < len(self.cfg.target_euler_angle_offsets) else (0.0, 0.0, 0.0),
-                target_phase_start_range=self.cfg.target_phase_start_ranges[i] if i < len(self.cfg.target_phase_start_ranges) else (0.0, 0.0),
-                target_phase_end_range=self.cfg.target_phase_end_ranges[i] if i < len(self.cfg.target_phase_end_ranges) else (1.0, 1.0),
+                target_phase_start=self.cfg.target_phase_starts[i] if i < len(self.cfg.target_phase_starts) else 0.0,
+                target_phase_end=self.cfg.target_phase_ends[i] if i < len(self.cfg.target_phase_ends) else 1.0,
             )
             self.motion_configs.append(motion_cfg)
         
@@ -1414,7 +1414,7 @@ class MultiTargetConditionedMotionCommand(CommandTerm):
 
         # Scale factor for target position Gaussian std (0 = no variance, 1 = full variance).
         # The curriculum modifies this over training.
-        self.target_pos_std_scale = 0.0
+        self.target_pos_std_scale = 1.0
 
         self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.body_pos_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 3, device=self.device)
@@ -1446,7 +1446,7 @@ class MultiTargetConditionedMotionCommand(CommandTerm):
         self.kernel = self.kernel / self.kernel.sum()
 
         # Between motion pausing
-        self.between_motion_pause_length = 1.0
+        self.between_motion_pause_length = 0.1
         self.between_motion_pause_time = torch.zeros(self.num_envs, device=self.device)
 
         self.metrics["error_anchor_pos"] = torch.zeros(self.num_envs, device=self.device)
@@ -1792,23 +1792,70 @@ class MultiTargetConditionedMotionCommand(CommandTerm):
                 offset_quat_expanded = offset_quat.expand(anchor_quat_w.shape)
                 self.target_orientation_w[env_indices_for_motion] = quat_mul(quat_mul(anchor_quat_w, rand_quat), offset_quat_expanded)
             
-            # Sample target time window (motion phase)
-            t_start = sample_uniform(
-                motion_cfg.target_phase_start_range[0],
-                motion_cfg.target_phase_start_range[1],
-                (motion_mask.sum().item(),),
-                device=self.device,
-            )
-            t_end = sample_uniform(
-                motion_cfg.target_phase_end_range[0],
-                motion_cfg.target_phase_end_range[1],
-                (motion_mask.sum().item(),),
-                device=self.device,
-            )
-            t_end = torch.maximum(t_end, t_start)
-            self.target_phase_start[env_indices_for_motion] = t_start
-            self.target_phase_end[env_indices_for_motion] = t_end
+            # Set target phase window
+            self.target_phase_start[env_indices_for_motion] = motion_cfg.target_phase_start
+            self.target_phase_end[env_indices_for_motion] = motion_cfg.target_phase_end
 
+
+    def _sample_next_motion(self, env_ids: Sequence[int]):
+        """Sample a new motion from the beginning without resetting robot state.
+
+        Unlike ``_resample_command`` this does not use adaptive sampling and does
+        not write robot joint/root state to sim.  It simply picks a random motion,
+        sets time_steps to 0, and samples a new target position/orientation.
+        """
+        if len(env_ids) == 0:
+            return
+
+        # Pick a random motion for each env
+        self.which_motion[env_ids] = torch.randint(0, len(self.motion_loaders), (len(env_ids),), device=self.device)
+        self.time_steps[env_ids] = 0
+
+        # Sample target positions and orientations for the new motions
+        for i in range(len(self.motion_configs)):
+            motion_mask = self.which_motion[env_ids] == i
+            if not torch.any(motion_mask):
+                continue
+
+            motion_cfg = self.motion_configs[i]
+            env_indices_for_motion = env_ids[motion_mask]
+
+            if motion_cfg.target_link:
+                target_body_idx = self.target_body_indices[i]
+                self.target_position_w[env_indices_for_motion] = (
+                    self.robot.data.body_pos_w[env_indices_for_motion, target_body_idx]
+                    + torch.tensor(motion_cfg.target_pos_offset, device=self.device)
+                )
+                offset = torch.tensor(motion_cfg.target_euler_angle_offset, device=self.device)
+                offset_quat = quat_from_euler_xyz(offset[0], offset[1], offset[2])
+                offset_quat_expanded = offset_quat.expand(self.robot.data.body_quat_w[env_indices_for_motion, target_body_idx].shape)
+                self.target_orientation_w[env_indices_for_motion] = quat_mul(
+                    self.robot.data.body_quat_w[env_indices_for_motion, target_body_idx],
+                    offset_quat_expanded,
+                )
+            else:
+                pos_mean = torch.tensor([motion_cfg.target_pos_mean.get(key, 0.0) for key in ["x", "y", "z"]], device=self.device)
+                pos_std = torch.tensor([motion_cfg.target_pos_std.get(key, 0.0) for key in ["x", "y", "z"]], device=self.device)
+                current_std = pos_std * self.target_pos_std_scale
+                n_samples = motion_mask.sum().item()
+                rand_samples = pos_mean.unsqueeze(0) + torch.randn(n_samples, 3, device=self.device) * current_std.unsqueeze(0)
+
+                euler_range_list = [motion_cfg.target_euler_angle_range.get(key, (0.0, 0.0)) for key in ["roll", "pitch", "yaw"]]
+                euler_ranges = torch.tensor(euler_range_list, device=self.device)
+                rand_euler = sample_uniform(euler_ranges[:, 0], euler_ranges[:, 1], (n_samples, 3), device=self.device)
+                rand_quat = quat_from_euler_xyz(rand_euler[:, 0], rand_euler[:, 1], rand_euler[:, 2])
+
+                anchor_pos_w = self.robot.data.body_pos_w[env_indices_for_motion, self.robot_anchor_body_index]
+                self.target_position_w[env_indices_for_motion] = rand_samples + anchor_pos_w + torch.tensor(motion_cfg.target_pos_offset, device=self.device)
+
+                anchor_quat_w = self.robot.data.body_quat_w[env_indices_for_motion, self.robot_anchor_body_index]
+                offset = torch.tensor(motion_cfg.target_euler_angle_offset, device=self.device)
+                offset_quat = quat_from_euler_xyz(offset[0], offset[1], offset[2])
+                offset_quat_expanded = offset_quat.expand(anchor_quat_w.shape)
+                self.target_orientation_w[env_indices_for_motion] = quat_mul(quat_mul(anchor_quat_w, rand_quat), offset_quat_expanded)
+
+            self.target_phase_start[env_indices_for_motion] = motion_cfg.target_phase_start
+            self.target_phase_end[env_indices_for_motion] = motion_cfg.target_phase_end
 
     def _update_command(self):
         """Update command each step: increment time steps, handle motion completion, update target positions for moving targets, and update adaptive tracking."""
@@ -1838,17 +1885,16 @@ class MultiTargetConditionedMotionCommand(CommandTerm):
                         offset_quat_expanded
                     )
         
-        # Check which environments need to reset (motion finished) - vectorized
+        # Check which environments have finished their current motion - vectorized
         motion_indices = self.which_motion
         timestep_limits = torch.tensor([self.motion_loaders[m].time_step_total for m in motion_indices.tolist()], device=self.device)
         env_ids_at_end_of_motion = torch.where(self.time_steps >= timestep_limits)[0]
         self.between_motion_pause_time[env_ids_at_end_of_motion] += self._env.cfg.sim.dt
-        env_ids_to_reset = env_ids_at_end_of_motion[self.between_motion_pause_time[env_ids_at_end_of_motion] >= self.between_motion_pause_length]
-        self.between_motion_pause_time[env_ids_to_reset] = 0.0
-        
-        if len(env_ids_to_reset) > 0:
-            self.time_steps[env_ids_to_reset] = 0
-            self._resample_command(env_ids_to_reset)
+        env_ids_to_continue = env_ids_at_end_of_motion[self.between_motion_pause_time[env_ids_at_end_of_motion] >= self.between_motion_pause_length]
+        self.between_motion_pause_time[env_ids_to_continue] = 0.0
+
+        if len(env_ids_to_continue) > 0:
+            self._sample_next_motion(env_ids_to_continue)
 
         # Update relative body poses
         anchor_pos_w_repeat = self.anchor_pos_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
@@ -1910,7 +1956,7 @@ class MultiTargetConditionedMotionCommand(CommandTerm):
 
 class Motion():
 
-    def __init__(self, motion_file, source_link, target_link, target_pos_mean, target_pos_std, target_euler_angle_range, target_pos_offset, target_euler_angle_offset, target_phase_start_range, target_phase_end_range):
+    def __init__(self, motion_file, source_link, target_link, target_pos_mean, target_pos_std, target_euler_angle_range, target_pos_offset, target_euler_angle_offset, target_phase_start, target_phase_end):
         self.motion_file = motion_file
         self.source_link = source_link
         self.target_link = target_link
@@ -1919,8 +1965,8 @@ class Motion():
         self.target_euler_angle_range = target_euler_angle_range
         self.target_pos_offset = target_pos_offset
         self.target_euler_angle_offset = target_euler_angle_offset
-        self.target_phase_start_range = target_phase_start_range
-        self.target_phase_end_range = target_phase_end_range
+        self.target_phase_start = target_phase_start
+        self.target_phase_end = target_phase_end
 
 @configclass
 class MultiTargetConditionedMotionCommandCfg(CommandTermCfg):
@@ -1972,8 +2018,8 @@ class MultiTargetConditionedMotionCommandCfg(CommandTermCfg):
     target_euler_angle_offsets: list[tuple[float, float, float]] = []
     """List of offsets added to the sampled target orientation as euler angles (x, y, z) in radians (applied after sampling, in world frame) for each motion."""
 
-    target_phase_start_ranges: list[tuple[float, float]] = []
-    """List of ranges for sampling target phase window start in motion timesteps for each motion."""
+    target_phase_starts: list[float] = []
+    """Target phase window start for each motion (0.0–1.0)."""
 
-    target_phase_end_ranges: list[tuple[float, float]] = []
-    """List of ranges for sampling target phase window end in motion timesteps for each motion."""
+    target_phase_ends: list[float] = []
+    """Target phase window end for each motion (0.0–1.0)."""
