@@ -1,5 +1,5 @@
 # policy_path: "/home/blake/gen_mimic/logs/rsl_rl/2026-02-09_12-27-27_multi_catch_3_broken_params.onnx"
-policy_path: "/home/blake/gen_mimic/logs/rsl_rl/g1_flat/2026-02-26_19-15-30_multi_catch_throw_handoff_axis_align_2/2026-02-26_19-15-30_multi_catch_throw_handoff_axis_align_2.onnx"
+policy_path: "/home/blake/gen_mimic/logs/rsl_rl/g1_flat/2026-03-13_16-47-14_multi_catch_sync_old_right_left_motions_curriculum/2026-03-13_16-47-14_multi_catch_sync_old_right_left_motions_curriculum.onnx"
 use_gpu: True
 plot_feet: False
 

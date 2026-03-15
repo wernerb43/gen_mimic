@@ -4,13 +4,17 @@ import os
 # Update the viewer at 30Hz
 import time
 
+import json
+import ast
+import xml.etree.ElementTree as ET
+
 import mujoco
 import mujoco.viewer
 import numpy as np
+import onnx
 import rclpy
 import yaml
 from rclpy.node import Node
-# from scipy.spatial.transform import Rotation as R
 from std_msgs.msg import Float32MultiArray, Float64
 
 
@@ -36,6 +40,9 @@ class MujocoSimNode(Node):
         # Publisher to signal RL policy to enable control (Float64: 0.0/1.0)
         self.control_enable_pub = self.create_publisher(Float64, "control_enable", 10)
 
+        self.torso_pose_pub = self.create_publisher(
+            Float32MultiArray, "torso_pose", 10
+        )
         self.ball_position_pub = self.create_publisher(
             Float32MultiArray, "ball_position", 10
         )
@@ -58,7 +65,7 @@ class MujocoSimNode(Node):
         
         ##################################################### Ball spawn configuration
         self.ball_spawn_time = 0.0  # Spawn ball at t=0.0s
-        self.ball_position = np.array([0.35, -0.2, 1.1])  # x, y, z position
+        self.ball_position = np.array([0.3, -0.1, 1.1])  # x, y, z position
         self.ball_orientation = np.array([1.0, 0.0, 0.0, 0.0])  # identity quaternion (w, x, y, z)
 
         # Randomization ranges for target position (relative to robot)
@@ -87,7 +94,59 @@ class MujocoSimNode(Node):
         self.simulation_dt = config["simulation_dt"]
 
         self.xml_path = config["xml_path"].replace("{G1_RL_ROOT_DIR}", G1_RL_ROOT_DIR)
+        self.robot_xml_path = config.get("robot_xml_path", self.xml_path).replace(
+            "{G1_RL_ROOT_DIR}", G1_RL_ROOT_DIR
+        )
+        policy_path = config["policy_path"].replace("{G1_RL_ROOT_DIR}", G1_RL_ROOT_DIR)
 
+        # Load default_joint_pos from ONNX metadata and convert to MuJoCo joint order
+        self.default_joint_pos = self._load_default_joint_pos_from_onnx(policy_path, self.robot_xml_path)
+
+
+    def _load_default_joint_pos_from_onnx(self, policy_path, robot_xml_path):
+        """Load default_joint_pos from ONNX metadata and convert from Isaac to MuJoCo joint order."""
+        onnx_model = onnx.load(policy_path)
+        meta = {}
+        for prop in onnx_model.metadata_props:
+            meta[prop.key] = prop.value
+        if "onnx_metadata" in meta:
+            try:
+                parsed = json.loads(meta["onnx_metadata"])
+            except Exception:
+                parsed = ast.literal_eval(meta["onnx_metadata"])
+        else:
+            parsed = {}
+            for k, v in meta.items():
+                try:
+                    parsed[k] = json.loads(v)
+                except Exception:
+                    try:
+                        parsed[k] = ast.literal_eval(v)
+                    except Exception:
+                        parsed[k] = v
+
+        onnx_joint_names = parsed.get("joint_names", [])
+        if isinstance(onnx_joint_names, str):
+            onnx_joint_names = [s.strip() for s in onnx_joint_names.split(",") if s.strip()]
+        default_joint_pos_isaac = np.array(parsed["default_joint_pos"], dtype=np.float64)
+
+        # Parse MuJoCo XML joint order
+        xml_joint_names = []
+        tree = ET.parse(robot_xml_path)
+        for joint in tree.getroot().iter("joint"):
+            name = joint.attrib.get("name")
+            if name:
+                xml_joint_names.append(name)
+        xml_joint_names.pop(0)  # remove floating base joint
+
+        # Convert Isaac order -> MuJoCo order
+        default_joint_pos_mujoco = np.zeros(len(xml_joint_names), dtype=np.float64)
+        for xml_idx, xml_name in enumerate(xml_joint_names):
+            if xml_name in onnx_joint_names:
+                onnx_idx = onnx_joint_names.index(xml_name)
+                default_joint_pos_mujoco[xml_idx] = default_joint_pos_isaac[onnx_idx]
+        self.get_logger().info(f"Loaded default_joint_pos from ONNX metadata ({len(default_joint_pos_mujoco)} joints)")
+        return default_joint_pos_mujoco
 
     def init_sim(self):
         self.m = mujoco.MjModel.from_xml_path(self.xml_path)
@@ -97,16 +156,18 @@ class MujocoSimNode(Node):
         self.target_dof_p = np.zeros(self.num_joints)
         self.target_dof_d = np.zeros(self.num_joints)
 
-        # --- Initialize robot joints to provided values ---
-        initial_joint_values = np.array([
-            -0.413, 0.0, 0.0, 0.807, -0.374, 0.0, -0.413, 0.0, 0.0, 0.807,
-            -0.374, 0.0, 0.0, 0.0, 0.0, 0.498, 0.3, 0.0, 0.501, 0.0,
-            0.0, 0.0, 0.498, -0.3, 0.0, 0.501, 0.0, 0.0, 0.0
-        ], dtype=np.float64)
-        self.d.qpos[7:7 + self.num_joints] = initial_joint_values
-        # Optionally, also set target positions to match initial
-        self.target_dof_pos = initial_joint_values.copy()
+        # Initialize robot joints to default pose from ONNX metadata (in MuJoCo joint order)
+        self.d.qpos[7:7 + self.num_joints] = self.default_joint_pos
+        self.target_dof_pos = self.default_joint_pos.copy()
         
+        # Find torso_link body ID (anchor body used in Isaac training)
+        try:
+            self.torso_body_id = mujoco.mj_name2id(self.m, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
+            self.get_logger().info(f"torso_link found: body_id={self.torso_body_id}")
+        except Exception as e:
+            self.get_logger().warning(f"torso_link body not found in model: {e}, falling back to root body")
+            self.torso_body_id = 1  # fallback to root
+
         # Find ball body and joint indices
         try:
             self.ball_body_id = mujoco.mj_name2id(self.m, mujoco.mjtObj.mjOBJ_BODY, "ball")
@@ -129,13 +190,13 @@ class MujocoSimNode(Node):
 
 
     def throw_ball_callback(self, msg):
-        """Randomize ball position within target range (relative to robot) and hold it in place."""
+        """Randomize ball position within target range (relative to torso_link) and hold it in place."""
         if self.ball_body_id is None:
             return
-        # Randomize position relative to robot
-        robot_pos = self.d.xpos[1]  # robot base position
-        x = robot_pos[0] + np.random.uniform(*self.target_x_range)
-        y = robot_pos[1] + np.random.uniform(*self.target_y_range)
+        # Randomize position relative to torso_link (anchor body used in Isaac training)
+        torso_pos = self.d.xpos[self.torso_body_id]
+        x = torso_pos[0] + np.random.uniform(*self.target_x_range)
+        y = torso_pos[1] + np.random.uniform(*self.target_y_range)
         z = np.random.uniform(*self.target_z_range)  # absolute height
         new_pos = np.array([x, y, z])
         # Place ball at randomized position with gravity compensation (static target)
@@ -241,6 +302,13 @@ class MujocoSimNode(Node):
         robot_position_msg = Float32MultiArray()
         robot_position_msg.data = robot_position.tolist()
         self.robot_position_pub.publish(robot_position_msg)
+
+        # Publish torso_link pose (position + quaternion) for anchor-frame observations
+        torso_pos = self.d.xpos[self.torso_body_id]
+        torso_quat = self.d.xquat[self.torso_body_id]
+        torso_pose_msg = Float32MultiArray()
+        torso_pose_msg.data = np.concatenate([torso_pos, torso_quat]).tolist()
+        self.torso_pose_pub.publish(torso_pose_msg)
         tmsg = Float64()
         tmsg.data = self.d.time  # Use actual mujoco sim time
         self.time_pub.publish(tmsg)

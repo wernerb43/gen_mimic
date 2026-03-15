@@ -54,6 +54,10 @@ class RLPolicyNode(Node):
             Float32MultiArray, "ball_orientation", self.ball_orientation_callback, 10
         )
 
+        self.torso_pose_sub = self.create_subscription(
+            Float32MultiArray, "torso_pose", self.torso_pose_callback, 10
+        )
+
         self.action_pub = self.create_publisher(Float32MultiArray, "action", 10)
         self.sim_time = 0.0
 
@@ -83,6 +87,9 @@ class RLPolicyNode(Node):
         # Lightweight state used by simplified node
 
         self.robot_position = np.zeros(3, dtype=np.float32)
+        # Torso (anchor body) pose — used for target position/orientation frame transforms
+        self.torso_position = np.zeros(3, dtype=np.float32)
+        self.torso_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
         self.qj = np.zeros(29, dtype=np.float32)
         self.dqj = np.zeros(29, dtype=np.float32)
         self.omega = np.zeros(3, dtype=np.float32)
@@ -615,6 +622,12 @@ class RLPolicyNode(Node):
         if len(received) == 4:
             self.ball_orientation = np.array(received, dtype=np.float32)
 
+    def torso_pose_callback(self, msg):
+        received = np.array(msg.data, dtype=np.float32)
+        if len(received) == 7:
+            self.torso_position = received[:3]
+            self.torso_quat = received[3:7]
+
     def isaac_to_mujoco(self, arr):
         """
         Convert a joint array from ONNX/IsaacLab order to MuJoCo/XML order.
@@ -655,19 +668,20 @@ class RLPolicyNode(Node):
         return np.zeros(2 * self.num_joints, dtype=np.float32)
 
     def obs_command_target_position(self):
-        # Transform ball position from world frame to robot body frame
+        # Transform ball position from world frame to torso_link (anchor body) frame
+        # This matches Isaac where target_position_b is relative to the anchor body
         # 1. Compute relative position in world frame
-        ball_pos_relative_w = self.ball_position - self.robot_position
-        
-        # 2. Rotate to body frame using inverse quaternion
-        q_inv = self._quat_conjugate(self.quat)
+        ball_pos_relative_w = self.ball_position - self.torso_position
+
+        # 2. Rotate to anchor body frame using inverse of torso quaternion
+        q_inv = self._quat_conjugate(self.torso_quat)
         ball_pos_body = self._quat_rotate(q_inv, ball_pos_relative_w)
 
-        # Add ball orientation as quaternion in the robot's body frame
+        # Transform ball orientation to anchor body frame
         ball_quat_body = self._quat_multiply(q_inv, self.ball_orientation)
 
         ball_pos_body = np.concatenate([ball_pos_body, ball_quat_body]).astype(np.float32)
-        
+
         return ball_pos_body.astype(np.float32)
 
     def obs_command_conditioned_imitate(self):
@@ -681,54 +695,54 @@ class RLPolicyNode(Node):
         return np.concatenate([cmd_imitate, cmd_target_pos]).astype(np.float32)
 
     def obs_motion_anchor_pos_b(self):
-        # Return motion anchor body position error in robot base frame
-        # This is: motion_anchor_pos_w - robot_anchor_pos_w, transformed to robot base frame
+        # Return motion anchor body position error in torso_link (anchor body) frame
+        # This matches Isaac: subtract_frame_transforms(robot_anchor, motion_anchor)
         if len(self.motion_trajectories) > 0 and self.which_motion < len(self.motion_trajectories):
             try:
-                # Anchor body is typically the first body (index 0, pelvis/base)
+                # Anchor body is typically the first body (index 0, pelvis/base) in motion data
                 motion_anchor_pos = self.motion_trajectories[self.which_motion]["body_pos_w"][self.motion_frame_idx, 0]  # (3,)
-                
-                # Robot anchor position is the robot's current position
-                robot_anchor_pos = self.robot_position  # (3,)
-                
+
+                # Robot anchor position is the torso_link position
+                robot_anchor_pos = self.torso_position  # (3,)
+
                 # Position difference in world frame
                 pos_error_w = motion_anchor_pos - robot_anchor_pos
-                
-                # Transform to robot base frame using quaternion
-                # q_inv rotates from world to body frame
-                q_inv = self._quat_conjugate(self.quat)
+
+                # Transform to anchor body frame using torso quaternion
+                q_inv = self._quat_conjugate(self.torso_quat)
                 pos_error_b = self._quat_rotate(q_inv, pos_error_w)
-                
+
                 return pos_error_b.astype(np.float32)
             except Exception as e:
                 self.get_logger().warn(f"Error computing motion anchor position: {e}")
         return np.zeros(3, dtype=np.float32)
 
     def obs_motion_anchor_ori_b(self):
-        # Return motion anchor body orientation error in robot base frame as 6D encoding
+        # Return motion anchor body orientation error in torso_link (anchor body) frame as 6D encoding
         # Format: [r00, r01, r10, r11, r20, r21] - first two columns of 3x3 rotation matrix
+        # This matches Isaac: subtract_frame_transforms(robot_anchor, motion_anchor) then matrix_from_quat
         if len(self.motion_trajectories) > 0 and self.which_motion < len(self.motion_trajectories):
             try:
                 # Get motion anchor orientation (first body, pelvis/base)
                 motion_anchor_quat = self.motion_trajectories[self.which_motion]["body_quat_w"][self.motion_frame_idx, 0]  # (4,) wxyz
-                
-                # Robot anchor orientation is the robot's current quaternion
-                robot_anchor_quat = self.quat  # (4,) wxyz
-                
+
+                # Robot anchor orientation is the torso_link quaternion
+                robot_anchor_quat = self.torso_quat  # (4,) wxyz
+
                 # Compute relative quaternion: quat_error = quat_robot_inv * quat_motion
                 q_inv = self._quat_conjugate(robot_anchor_quat)
                 q_rel = self._quat_multiply(q_inv, motion_anchor_quat)
-                
+
                 # Convert quaternion to rotation matrix
                 rot_mat = self._quat_to_rotation_matrix(q_rel)
-                
+
                 # Extract 6D encoding: [r00, r01, r10, r11, r20, r21]
                 ori_6d = np.array([
                     rot_mat[0, 0], rot_mat[0, 1],
                     rot_mat[1, 0], rot_mat[1, 1],
                     rot_mat[2, 0], rot_mat[2, 1]
                 ], dtype=np.float32)
-                
+
                 return ori_6d
             except Exception as e:
                 self.get_logger().warn(f"Error computing motion anchor orientation: {e}")
