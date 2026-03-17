@@ -41,7 +41,7 @@ from common.command_helper import (
 # from common.remote_controller import KeyMap, RemoteController
 # from common.rotation_helper import get_gravity_orientation, transform_imu_data
 from dex3_hand_interface import Dex3HandController
-from geometry_msgs.msg import TransformStamped, Twist
+from geometry_msgs.msg import Point, TransformStamped, Twist
 from nav_msgs.msg import GridCells
 # from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
 # from rcl_interfaces.srv import SetParameters
@@ -277,12 +277,13 @@ class Controller(Node):
             self.left_hand = None
             self.right_hand = None
         
-        # Initialize ball intercept position subscriber
+        # Initialize ball position subscriber (from /ball_pose_topic as geometry_msgs/Point)
         self.ball_position = np.zeros(3, dtype=np.float32)
+        self.ball_orientation = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
         self.ball_position_subscriber = self.create_subscription(
-            Float32MultiArray,
-            "/ball_position",
-            self.ball_position_callback,
+            Point,
+            "/ball_pose_topic",
+            self.ball_pose_callback,
             10,
         )
         
@@ -291,26 +292,10 @@ class Controller(Node):
         # Start keyboard listener
         self._keyboard_thread.start()
 
-    def ball_position_callback(self, msg):
-        if len(msg.data) >= 3:
-            self.ball_position = np.array(msg.data[:3], dtype=np.float32)
-            # Select motion based on ball y position
-            # Assuming 3 motions: left (negative y), center (y near 0), right (positive y)
-            if self.motion_trajectories and len(self.motion_trajectories) >= 3:
-                ball_x = self.ball_position[0]
-                ball_y = self.ball_position[1]
-                if ball_x < 0.3:  # Ball is far, use motion 0
-                    self.which_motion = 0
-                elif ball_y < -0.0:  # Ball is to the right
-                    self.which_motion = 1
-                elif ball_y > 0.3:  # Ball is to the left
-                    self.which_motion = 2
-                else:  # Ball is in the center
-                    self.which_motion = 3
-                if ball_x ==0.2 and ball_y == 0.2:
-                    self.which_motion = 4
-        else:
-            self.get_logger().warning(f"Received ball position with insufficient data: {msg.data}")
+    def ball_pose_callback(self, msg: Point):
+        # Store ball position from Point message, override x to constant 0.3
+        self.ball_position = np.array([0.32, msg.y, msg.z + 0.3], dtype=np.float32)
+        print(f"[BallPose] Received: x={msg.x:.3f}, y={msg.y:.3f}, z={msg.z:.3f} -> using x=0.3", flush=True)
 
     def load_config(self):
         G1_RL_ROOT_DIR = os.getenv("G1_RL_ROOT_DIR")
@@ -1131,7 +1116,17 @@ class Controller(Node):
             self._kb_request_state = ControllerState.DEFAULT_POSE
         elif key == "p":
             if self.current_state == ControllerState.POLICY:
-                # While in policy mode, play motion once from current frame
+                # Select motion based on ball y position (body frame), then play
+                ball_y = self.ball_position[1]
+                print(f"[Keyboard] Ball position in body frame: y={ball_y:.3f}", flush=True)
+                if ball_y < 0.0:
+                    self.which_motion = 0
+                elif ball_y > 0.3:
+                    self.which_motion = 1
+                else:
+                    self.which_motion = 2
+                print(f"[Keyboard] Selected motion {self.which_motion}", flush=True)
+                self.motion_frame_idx = self.initial_pose_index
                 self._play_motion_once = True
             else:
                 self._kb_request_state = ControllerState.POLICY

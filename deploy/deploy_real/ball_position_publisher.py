@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
 Simple ROS2 publisher for ball position.
-Publishes Float32MultiArray messages to /ball_position topic.
+Publishes geometry_msgs/Point messages to /ball_pose_topic.
 
 Usage:
     python ball_position_publisher.py [--frequency 30]
 
-The script publishes ball position as [x, y, z] coordinates.
+The script publishes ball position as a Point (x, y, z) message.
 You can modify the hardcoded positions or add interactive input as needed.
 """
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32MultiArray
+from geometry_msgs.msg import Point
 import numpy as np
 import time
 import sys
@@ -21,35 +21,37 @@ import sys
 class BallPositionPublisher(Node):
     def __init__(self):
         super().__init__('ball_position_publisher')
-        
+
         # Get frequency parameter
         self.declare_parameter('frequency', 30)  # Hz
         frequency = self.get_parameter('frequency').value
         self.publish_period = 1.0 / frequency
-        
+
         # Create publisher
-        self.publisher = self.create_publisher(Float32MultiArray, '/ball_position', 10)
-        
+        self.publisher = self.create_publisher(Point, '/ball_pose_topic', 10)
+
         # Initial ball position (x, y, z in meters)
         # Modify these values as needed
-        self.ball_position = np.array([0.22, -0.2, 0.2], dtype=np.float32)
-        
+        self.ball_position = np.array([0.3, 0.0, 0.2], dtype=np.float32)
+
         self.get_logger().info(
             f"Ball Position Publisher started at {frequency} Hz\n"
             f"Initial position: {self.ball_position}\n"
-            f"Publishing to /ball_position topic"
+            f"Publishing to /ball_pose_topic topic"
         )
-        
+
         # Create a timer to publish at regular intervals
         self.timer = self.create_timer(self.publish_period, self.publish_callback)
-    
+
     def publish_callback(self):
         """Publish the current ball position"""
-        msg = Float32MultiArray()
-        msg.data = self.ball_position.tolist()
+        msg = Point()
+        msg.x = float(self.ball_position[0])
+        msg.y = float(self.ball_position[1])
+        msg.z = float(self.ball_position[2])
         self.publisher.publish(msg)
         self.get_logger().debug(f"Published ball position: {self.ball_position}")
-    
+
     def set_ball_position(self, x, y, z):
         """Update the ball position"""
         self.ball_position = np.array([x, y, z], dtype=np.float32)
