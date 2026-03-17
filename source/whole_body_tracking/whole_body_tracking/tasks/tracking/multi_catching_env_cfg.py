@@ -369,10 +369,10 @@ class TerminationsCfg:
 class CurriculumCfg:
     """Curriculum terms for the MDP."""
 
-    decay_imitation_rewards = CurrTerm(
-        func=mdp.decay_imitation_reward_weights,
-        params={"hold_steps": 5000, "decay_steps": 5000, "term_prefixes": ("motion_",)},
-    )
+    # decay_imitation_rewards = CurrTerm(
+    #     func=mdp.decay_imitation_reward_weights,
+    #     params={"hold_steps": 5000, "decay_steps": 5000, "term_prefixes": ("motion_",)},
+    # )
 
     # ramp_target_pos_variance = CurrTerm(
     #     func=mdp.ramp_target_pos_variance,
@@ -384,6 +384,7 @@ class CurriculumCfg:
     #         "ema_alpha": 0.01,
     #     },
     # )
+    pass
 
 ##
 # Environment configuration

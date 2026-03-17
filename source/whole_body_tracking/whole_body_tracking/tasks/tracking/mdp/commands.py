@@ -1446,8 +1446,17 @@ class MultiTargetConditionedMotionCommand(CommandTerm):
         self.kernel = self.kernel / self.kernel.sum()
 
         # Between motion pausing
-        self.between_motion_pause_length = 0.1
+        self.between_motion_pause_length = 0.3
         self.between_motion_pause_time = torch.zeros(self.num_envs, device=self.device)
+        self.is_paused = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # Cached robot state for hold-still during pause
+        num_bodies = len(self.cfg.body_names)
+        num_joints = self.robot.data.joint_pos.shape[-1]
+        self._paused_body_pos_w = torch.zeros(self.num_envs, num_bodies, 3, device=self.device)
+        self._paused_body_quat_w = torch.zeros(self.num_envs, num_bodies, 4, device=self.device)
+        self._paused_body_quat_w[..., 0] = 1.0
+        self._paused_joint_pos = torch.zeros(self.num_envs, num_joints, device=self.device)
+        self._paused_joint_vel = torch.zeros(self.num_envs, num_joints, device=self.device)
 
         self.metrics["error_anchor_pos"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["error_anchor_rot"] = torch.zeros(self.num_envs, device=self.device)
@@ -1500,54 +1509,80 @@ class MultiTargetConditionedMotionCommand(CommandTerm):
     
     @property
     def joint_pos(self) -> torch.Tensor:
-        return self._gather_motion_tensor(lambda motion, mask: motion.joint_pos[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask])])
+        val = self._gather_motion_tensor(lambda motion, mask: motion.joint_pos[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask])])
+        if torch.any(self.is_paused):
+            val[self.is_paused] = self._paused_joint_pos[self.is_paused]
+        return val
 
     @property
     def joint_vel(self) -> torch.Tensor:
-        return self._gather_motion_tensor(lambda motion, mask: motion.joint_vel[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask])])
-    
+        val = self._gather_motion_tensor(lambda motion, mask: motion.joint_vel[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask])])
+        if torch.any(self.is_paused):
+            val[self.is_paused] = self._paused_joint_vel[self.is_paused]
+        return val
+
     @property
     def body_pos_w(self) -> torch.Tensor:
         body_pos = self._gather_motion_tensor(lambda motion, mask: motion.body_pos_w[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask])])
-        return body_pos + self._env.scene.env_origins[:, None, :]
+        body_pos = body_pos + self._env.scene.env_origins[:, None, :]
+        if torch.any(self.is_paused):
+            body_pos[self.is_paused] = self._paused_body_pos_w[self.is_paused]
+        return body_pos
 
     @property
     def body_quat_w(self) -> torch.Tensor:
-        return self._gather_motion_tensor(lambda motion, mask: motion.body_quat_w[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask])])
-    
+        val = self._gather_motion_tensor(lambda motion, mask: motion.body_quat_w[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask])])
+        if torch.any(self.is_paused):
+            val[self.is_paused] = self._paused_body_quat_w[self.is_paused]
+        return val
+
     @property
     def body_lin_vel_w(self) -> torch.Tensor:
-        return self._gather_motion_tensor(lambda motion, mask: motion.body_lin_vel_w[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask])])
+        vel = self._gather_motion_tensor(lambda motion, mask: motion.body_lin_vel_w[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask])])
+        vel[self.is_paused] = 0.0
+        return vel
 
     @property
     def body_ang_vel_w(self) -> torch.Tensor:
-        return self._gather_motion_tensor(lambda motion, mask: motion.body_ang_vel_w[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask])])
+        vel = self._gather_motion_tensor(lambda motion, mask: motion.body_ang_vel_w[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask])])
+        vel[self.is_paused] = 0.0
+        return vel
 
     @property
     def anchor_pos_w(self) -> torch.Tensor:
         anchor_pos = self._gather_motion_tensor(
             lambda motion, mask: motion.body_pos_w[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask]), self.motion_anchor_body_index]
         )
-        return anchor_pos + self._env.scene.env_origins
+        anchor_pos = anchor_pos + self._env.scene.env_origins
+        if torch.any(self.is_paused):
+            anchor_pos[self.is_paused] = self._paused_body_pos_w[self.is_paused, self.motion_anchor_body_index]
+        return anchor_pos
 
     @property
     def anchor_quat_w(self) -> torch.Tensor:
-        return self._gather_motion_tensor(
+        val = self._gather_motion_tensor(
             lambda motion, mask: motion.body_quat_w[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask]), self.motion_anchor_body_index]
         )
+        if torch.any(self.is_paused):
+            val[self.is_paused] = self._paused_body_quat_w[self.is_paused, self.motion_anchor_body_index]
+        return val
 
     @property
     def anchor_lin_vel_w(self) -> torch.Tensor:
-        return self._gather_motion_tensor(
+        vel = self._gather_motion_tensor(
             lambda motion, mask: motion.body_lin_vel_w[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask]), self.motion_anchor_body_index]
         )
+        vel[self.is_paused] = 0.0
+        return vel
 
     @property
     def anchor_ang_vel_w(self) -> torch.Tensor:
-        return self._gather_motion_tensor(
+        vel = self._gather_motion_tensor(
             lambda motion, mask: motion.body_ang_vel_w[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask]), self.motion_anchor_body_index]
         )
-    
+        vel[self.is_paused] = 0.0
+        return vel
+
     @property
     def robot_joint_pos(self) -> torch.Tensor:
         return self.robot.data.joint_pos
@@ -1885,13 +1920,29 @@ class MultiTargetConditionedMotionCommand(CommandTerm):
                         offset_quat_expanded
                     )
         
-        # Check which environments have finished their current motion - vectorized
+        # Check which environments have finished their current motion
         motion_indices = self.which_motion
         timestep_limits = torch.tensor([self.motion_loaders[m].time_step_total for m in motion_indices.tolist()], device=self.device)
         env_ids_at_end_of_motion = torch.where(self.time_steps >= timestep_limits)[0]
+        # Snapshot robot state on first frame of pause (transition from not-paused to paused)
+        newly_paused = env_ids_at_end_of_motion[~self.is_paused[env_ids_at_end_of_motion]]
+        if len(newly_paused) > 0:
+            self._paused_body_pos_w[newly_paused] = self.robot.data.body_pos_w[newly_paused][:, self.body_indexes]
+            self._paused_body_quat_w[newly_paused] = self.robot.data.body_quat_w[newly_paused][:, self.body_indexes]
+            self._paused_joint_pos[newly_paused] = self.robot.data.joint_pos[newly_paused]
+            self._paused_joint_vel[newly_paused] = self.robot.data.joint_vel[newly_paused]
+        self.is_paused[:] = False
+        self.is_paused[env_ids_at_end_of_motion] = True
         self.between_motion_pause_time[env_ids_at_end_of_motion] += self._env.cfg.sim.dt
         env_ids_to_continue = env_ids_at_end_of_motion[self.between_motion_pause_time[env_ids_at_end_of_motion] >= self.between_motion_pause_length]
         self.between_motion_pause_time[env_ids_to_continue] = 0.0
+
+        # print out the current motion index and motion imitation for debugging
+        # print("Current motion indices:", self.which_motion)
+        # print("Current motion imitation error (joint pos):", self.metrics["error_joint_pos"])
+        # print("current motion index and time steps:", list(zip(self.which_motion.tolist(), self.time_steps.tolist())))
+
+
 
         if len(env_ids_to_continue) > 0:
             self._sample_next_motion(env_ids_to_continue)
@@ -1909,7 +1960,7 @@ class MultiTargetConditionedMotionCommand(CommandTerm):
         self.body_quat_relative_w = quat_mul(delta_ori_w, self.body_quat_w)
         self.body_pos_relative_w = delta_pos_w + quat_apply(delta_ori_w, self.body_pos_w - anchor_pos_w_repeat)
 
-        # Update adaptive failure tracking per motion - vectorized
+        # Update adaptive failure tracking per motion
         for i in range(len(self.motion_loaders)):
             self.bin_failed_counts[i] = (
                 self.cfg.adaptive_alpha * self._current_bin_failed[i] 
