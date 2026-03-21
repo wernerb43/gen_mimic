@@ -65,13 +65,14 @@ class MujocoSimNode(Node):
         
         ##################################################### Ball spawn configuration
         self.ball_spawn_time = 0.0  # Spawn ball at t=0.0s
-        self.ball_position = np.array([0.3, -0.1, 1.1])  # x, y, z position
+        # Nominal ball offset from torso_link (matches target_pos_means in multi_catching_env_cfg.py)
+        self.ball_offset = np.array([0.4807, -0.0159, 0.0493])  # x, y, z offset from torso_link
         self.ball_orientation = np.array([1.0, 0.0, 0.0, 0.0])  # identity quaternion (w, x, y, z)
 
-        # Randomization ranges for target position (relative to robot)
-        self.target_x_range = (0.3, 0.35)   # forward distance from robot
-        self.target_y_range = (-0.4, 0.4)  # lateral range
-        self.target_z_range = (0.9, 1.2)   # height range
+        # Randomization ranges for target position (offset from torso_link, matches training)
+        self.target_x_range = (0.4807, 0.4807)   # forward offset from torso_link
+        self.target_y_range = (-0.1, 0.1)         # lateral offset from torso_link
+        self.target_z_range = (-0.1, 0.1)         # vertical offset from torso_link
         #####################################################
 
         self.ball_spawned = False
@@ -190,32 +191,36 @@ class MujocoSimNode(Node):
 
 
     def throw_ball_callback(self, msg):
-        """Randomize ball position within target range (relative to torso_link) and hold it in place."""
+        """Randomize ball position within target range (offset from torso_link) and hold it in place."""
         if self.ball_body_id is None:
             return
-        # Randomize position relative to torso_link (anchor body used in Isaac training)
+        # Randomize offset from torso_link (matches target_pos_means convention in training)
         torso_pos = self.d.xpos[self.torso_body_id]
-        x = torso_pos[0] + np.random.uniform(*self.target_x_range)
-        y = torso_pos[1] + np.random.uniform(*self.target_y_range)
-        z = np.random.uniform(*self.target_z_range)  # absolute height
-        new_pos = np.array([x, y, z])
+        offset = np.array([
+            np.random.uniform(*self.target_x_range),
+            np.random.uniform(*self.target_y_range),
+            np.random.uniform(*self.target_z_range),
+        ])
+        new_pos = torso_pos + offset
         # Place ball at randomized position with gravity compensation (static target)
         self.m.body_gravcomp[self.ball_body_id] = 1.0
         self.d.qpos[self.ball_joint_qpos_adr:self.ball_joint_qpos_adr + 3] = new_pos
         self.d.qpos[self.ball_joint_qpos_adr + 3:self.ball_joint_qpos_adr + 7] = [1, 0, 0, 0]
         self.d.qvel[self.ball_joint_qvel_adr:self.ball_joint_qvel_adr + 6] = 0.0
         self.ball_spawned = True
-        print(f"Target randomized at position: [{x:.3f}, {y:.3f}, {z:.3f}]")
+        # print(f"Target randomized at position: [{x:.3f}, {y:.3f}, {z:.3f}]")
 
     def reset_ball_callback(self, msg):
         if self.ball_body_id is None:
             return
         self.m.body_gravcomp[self.ball_body_id] = self.ball_gravcomp_default
-        self.d.qpos[self.ball_joint_qpos_adr:self.ball_joint_qpos_adr + 3] = self.ball_position
+        torso_pos = self.d.xpos[self.torso_body_id]
+        ball_pos = torso_pos + self.ball_offset
+        self.d.qpos[self.ball_joint_qpos_adr:self.ball_joint_qpos_adr + 3] = ball_pos
         self.d.qpos[self.ball_joint_qpos_adr + 3:self.ball_joint_qpos_adr + 7] = [1, 0, 0, 0]
         self.d.qvel[self.ball_joint_qvel_adr:self.ball_joint_qvel_adr + 6] = 0.0
         self.ball_spawned = True
-        print("Reset ball command received. Ball reset to initial position with gravity compensation on.")
+        print(f"Reset ball to torso_link + offset: {ball_pos}")
 
 
     def action_callback(self, msg):
@@ -231,15 +236,17 @@ class MujocoSimNode(Node):
         self.viewer.cam.trackbodyid = 1  # ID of the robot's main body
         start_time = time.time()  # Start timing at the very beginning of the step
         
-        # Spawn ball at prescribed time and position
+        # Spawn ball at prescribed time and position (offset from torso_link)
         if not self.ball_spawned and self.d.time >= self.ball_spawn_time and self.ball_body_id is not None:
+            torso_pos = self.d.xpos[self.torso_body_id]
+            ball_pos = torso_pos + self.ball_offset
             # Set ball position (qpos for free joint: x, y, z, qw, qx, qy, qz)
-            self.d.qpos[self.ball_joint_qpos_adr:self.ball_joint_qpos_adr+3] = self.ball_position
+            self.d.qpos[self.ball_joint_qpos_adr:self.ball_joint_qpos_adr+3] = ball_pos
             self.d.qpos[self.ball_joint_qpos_adr+3:self.ball_joint_qpos_adr+7] = [1, 0, 0, 0]  # identity quaternion
             # Zero initial velocity
             self.d.qvel[self.ball_joint_qvel_adr:self.ball_joint_qvel_adr+6] = 0.0
             self.ball_spawned = True
-            self.get_logger().info(f"Ball spawned at position {self.ball_position} at t={self.d.time:.3f}s")
+            self.get_logger().info(f"Ball spawned at torso_link + {self.ball_offset} = {ball_pos} at t={self.d.time:.3f}s")
         
         # Hold robot upright for initial period: fix base pose and zero base velocities
         if self.d.time < self._hold_upright_duration:
