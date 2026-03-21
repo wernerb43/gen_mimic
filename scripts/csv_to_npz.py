@@ -30,6 +30,12 @@ parser.add_argument(
 )
 parser.add_argument("--output_name", type=str, required=True, help="The name of the motion npz file.")
 parser.add_argument("--output_fps", type=int, default=50, help="The fps of the output motion.")
+parser.add_argument(
+    "--query_link", type=str, default=None, help="Body/link name to query position for (e.g. right_palm_link)."
+)
+parser.add_argument(
+    "--query_frame", type=int, default=None, help="CSV row number (1-indexed) at which to query the link position."
+)
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -243,6 +249,35 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, joi
     file_saved = False
     # --------------------------------------------------------------------------
 
+    # ------- query setup -------------------------------------------------------
+    query_output_frame = None
+    if args_cli.query_link is not None and args_cli.query_frame is not None:
+        body_names = robot.data.body_names
+        anchor_name = "torso_link"
+        if args_cli.query_link not in body_names:
+            raise ValueError(
+                f"query_link '{args_cli.query_link}' not found. Available bodies: {body_names}"
+            )
+        query_link_idx = body_names.index(args_cli.query_link)
+        anchor_idx = body_names.index(anchor_name)
+
+        # Convert CSV row (1-indexed) to input frame index, then to time, then to output frame
+        csv_row = args_cli.query_frame
+        if args_cli.frame_range is not None:
+            input_idx = csv_row - args_cli.frame_range[0]
+        else:
+            input_idx = csv_row - 1  # CSV row 1 = input index 0
+        input_time = input_idx * motion.input_dt
+        query_output_frame = round(input_time / motion.output_dt)
+        query_output_frame = max(0, min(query_output_frame, motion.output_frames - 1))
+        print(
+            f"[QUERY] Will query '{args_cli.query_link}' relative to '{anchor_name}' "
+            f"at CSV row {csv_row} (output frame {query_output_frame})"
+        )
+    query_printed = False
+    initial_anchor_pos_w = None  # captured after rendering frame 0
+    # --------------------------------------------------------------------------
+
     # Simulation loop
     while simulation_app.is_running():
         (
@@ -285,6 +320,34 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, joi
             log["body_quat_w"].append(robot.data.body_quat_w[0, :].cpu().numpy().copy())
             log["body_lin_vel_w"].append(robot.data.body_lin_vel_w[0, :].cpu().numpy().copy())
             log["body_ang_vel_w"].append(robot.data.body_ang_vel_w[0, :].cpu().numpy().copy())
+
+        # ------- capture initial anchor pose at frame 0 -----------------------
+        if query_output_frame is not None and initial_anchor_pos_w is None:
+            rendered_frame = (motion.current_idx - 1) % motion.output_frames
+            if rendered_frame == 0:
+                initial_anchor_pos_w = robot.data.body_pos_w[0, anchor_idx].clone()
+        # ----------------------------------------------------------------------
+
+        # ------- query link position relative to initial anchor ---------------
+        if query_output_frame is not None and not query_printed and initial_anchor_pos_w is not None:
+            rendered_frame = (motion.current_idx - 1) % motion.output_frames
+            if rendered_frame == query_output_frame:
+                link_pos_w = robot.data.body_pos_w[0, query_link_idx]  # (3,)
+
+                # Offset from the initial (t=0) anchor position in world frame
+                # This matches how target_pos_means is used in commands.py:
+                #   target_position_w = mean + anchor_pos_w_at_reset
+                offset = link_pos_w - initial_anchor_pos_w  # (3,)
+
+                print(f"\n{'='*60}")
+                print(f"[QUERY RESULT] '{args_cli.query_link}' relative to initial '{anchor_name}' position")
+                print(f"  CSV row: {args_cli.query_frame}")
+                print(f"  Output frame: {query_output_frame}")
+                print(f"  Offset from initial anchor (x, y, z): {offset[0]:.4f}, {offset[1]:.4f}, {offset[2]:.4f}")
+                print(f"  For target_pos_means: {{\"x\": {offset[0]:.4f}, \"y\": {offset[1]:.4f}, \"z\": {offset[2]:.4f}}}")
+                print(f"{'='*60}\n")
+                query_printed = True
+        # ----------------------------------------------------------------------
 
         if reset_flag and not file_saved:
             file_saved = True

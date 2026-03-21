@@ -17,6 +17,19 @@ from isaaclab.app import AppLauncher
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Replay converted motions.")
 parser.add_argument("--registry_name", type=str, required=True, help="The name of the wand registry.")
+parser.add_argument(
+    "--query_pos",
+    nargs=3,
+    type=float,
+    metavar=("X", "Y", "Z"),
+    help="Position in body frame (relative to torso_link) to visualize as a sphere marker.",
+)
+parser.add_argument(
+    "--query_link",
+    type=str,
+    default="torso_link",
+    help="The anchor body whose frame the query_pos is specified in (default: torso_link).",
+)
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -31,6 +44,7 @@ simulation_app = app_launcher.app
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, ArticulationCfg, AssetBaseCfg
+from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
 from isaaclab.sim import SimulationContext
 from isaaclab.utils import configclass
@@ -85,6 +99,27 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     )
     time_steps = torch.zeros(scene.num_envs, dtype=torch.long, device=sim.device)
 
+    # ------- query position marker setup --------------------------------------
+    query_marker = None
+    query_offset = None
+    anchor_body_idx = None
+    query_marker_pos_w = None  # fixed world-frame position, set once from initial anchor
+    if args_cli.query_pos is not None:
+        query_offset = torch.tensor(args_cli.query_pos, dtype=torch.float32, device=sim.device)
+        body_names = robot.data.body_names
+        anchor_body_idx = body_names.index(args_cli.query_link)
+        marker_cfg = VisualizationMarkersCfg(
+            prim_path="/Visuals/QueryPosition",
+            markers={
+                "sphere": sim_utils.SphereCfg(
+                    radius=0.05,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0)),
+                ),
+            },
+        )
+        query_marker = VisualizationMarkers(marker_cfg)
+    # --------------------------------------------------------------------------
+
     # Simulation loop
     while simulation_app.is_running():
         time_steps += 1
@@ -102,6 +137,15 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         scene.write_data_to_sim()
         sim.render()  # We don't want physic (sim.step())
         scene.update(sim_dt)
+
+        # ------- update query marker in world frame -----------------------------
+        if query_marker is not None:
+            # Capture initial anchor position when motion resets to frame 0
+            if time_steps[0] == 0 or query_marker_pos_w is None:
+                initial_anchor_pos = robot.data.body_pos_w[0, anchor_body_idx]  # (3,)
+                query_marker_pos_w = initial_anchor_pos + query_offset  # (3,)
+            query_marker.visualize(query_marker_pos_w.unsqueeze(0))
+        # ----------------------------------------------------------------------
 
         pos_lookat = root_states[0, :3].cpu().numpy()
         sim.set_camera_view(pos_lookat + np.array([2.0, 2.0, 0.5]), pos_lookat)
