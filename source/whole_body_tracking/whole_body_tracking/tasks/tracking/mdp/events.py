@@ -91,3 +91,80 @@ def randomize_rigid_body_com(
 
     # Set the new coms
     asset.root_physx_view.set_coms(coms, env_ids)
+
+
+def apply_force_in_direction_during_contact(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    force_range: tuple[float, float],
+    direction: tuple[float, float, float],
+    command_name: str,
+    motion_index: int,
+    force_duration_s: float = 0.1,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+):
+    """Apply an external force in the body frame of specified bodies, triggered by the contact phase.
+
+    When an env enters the contact phase, a force magnitude is sampled and persisted
+    for ``force_duration_s`` seconds. The force continues even after the phase window
+    ends, ensuring the impulse has time to take effect.
+
+    Args:
+        force_range: Min / max force magnitude (N).
+        direction: 3-tuple giving the desired force direction in the body's local frame
+            (will be normalised).
+        command_name: Name of the command term to read phase info from.
+        motion_index: Which motion's phase window to use.
+        force_duration_s: How long (seconds) the force persists once triggered.
+        asset_cfg: Asset and body specification (use ``body_names`` to pick links).
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    command = env.command_manager.get_term(command_name)
+    num_bodies = len(asset_cfg.body_ids) if asset_cfg.body_ids != slice(None) else asset.num_bodies
+    num_envs = env.scene.num_envs
+
+    # Lazily initialise persistent state on first call
+    state = apply_force_in_direction_during_contact.__dict__
+    if "_steps_remaining" not in state or state["_steps_remaining"].shape[0] != num_envs:
+        state["_steps_remaining"] = torch.zeros(num_envs, device=asset.device, dtype=torch.long)
+        state["_magnitudes"] = torch.zeros(num_envs, device=asset.device)
+
+    steps_remaining = state["_steps_remaining"]
+    cached_magnitudes = state["_magnitudes"]
+
+    duration_steps = max(1, int(force_duration_s / env.cfg.sim.dt))
+
+    # Compute current phase (0-1) for each env
+    motion_cfg = command.motion_configs[motion_index]
+    time_step_total = command.motion_loaders[motion_index].time_step_total
+    phase = command.time_steps.float() / max(time_step_total, 1)
+
+    # Determine which envs just entered the contact phase (trigger new force)
+    in_phase = (phase >= motion_cfg.target_phase_start) & (phase <= motion_cfg.target_phase_end)
+    correct_motion = command.which_motion == motion_index
+    newly_triggered = in_phase & correct_motion & (steps_remaining == 0)
+
+    # Sample and store magnitudes for newly triggered envs
+    if newly_triggered.any():
+        new_ids = torch.where(newly_triggered)[0]
+        cached_magnitudes[new_ids] = torch.empty(len(new_ids), device=asset.device).uniform_(*force_range)
+        steps_remaining[new_ids] = duration_steps
+
+    # Normalise direction (body-frame)
+    dir_t = torch.tensor(direction, device=asset.device, dtype=torch.float32)
+    dir_t = dir_t / dir_t.norm()
+
+    # Build force for all envs (active = steps_remaining > 0)
+    active = steps_remaining > 0
+    magnitudes = torch.where(active, cached_magnitudes, torch.zeros_like(cached_magnitudes))
+
+    forces = dir_t.unsqueeze(0).unsqueeze(0) * magnitudes.unsqueeze(-1).unsqueeze(-1)
+    forces = forces.expand(num_envs, num_bodies, 3).clone()
+    torques = torch.zeros_like(forces)
+
+    # Decrement counters
+    steps_remaining[active] -= 1
+
+    asset.set_external_force_and_torque(
+        forces, torques, env_ids=torch.arange(num_envs, device=asset.device), body_ids=asset_cfg.body_ids
+    )

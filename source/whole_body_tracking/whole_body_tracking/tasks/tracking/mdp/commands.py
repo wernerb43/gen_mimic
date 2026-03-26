@@ -1409,7 +1409,65 @@ class MultiTargetConditionedMotionCommand(CommandTerm):
                 self.target_body_indices.append(self.robot.body_names.index(motion_cfg.target_link))
             else:
                 self.target_body_indices.append(None)
-        
+
+        # Pre-stack motion data for vectorized access (eliminates per-motion loops)
+        num_motions = len(self.motion_loaders)
+        max_T = max(m.time_step_total for m in self.motion_loaders)
+
+        def _pad_stack(tensors, max_len):
+            padded = []
+            for t in tensors:
+                if t.shape[0] < max_len:
+                    pad = t[-1:].expand((max_len - t.shape[0],) + t.shape[1:])
+                    t = torch.cat([t, pad], dim=0)
+                padded.append(t)
+            return torch.stack(padded)
+
+        self._stacked_joint_pos = _pad_stack([m.joint_pos for m in self.motion_loaders], max_T)
+        self._stacked_joint_vel = _pad_stack([m.joint_vel for m in self.motion_loaders], max_T)
+        self._stacked_body_pos_w = _pad_stack([m.body_pos_w for m in self.motion_loaders], max_T)
+        self._stacked_body_quat_w = _pad_stack([m.body_quat_w for m in self.motion_loaders], max_T)
+        self._stacked_body_lin_vel_w = _pad_stack([m.body_lin_vel_w for m in self.motion_loaders], max_T)
+        self._stacked_body_ang_vel_w = _pad_stack([m.body_ang_vel_w for m in self.motion_loaders], max_T)
+        self._time_step_totals = torch.tensor([m.time_step_total for m in self.motion_loaders], device=self.device)
+
+        # Pre-compute per-motion indices as tensors
+        self._source_body_indices_t = torch.tensor(self.source_body_indices, device=self.device, dtype=torch.long)
+        self._target_body_indices_t = torch.tensor(
+            [idx if idx is not None else 0 for idx in self.target_body_indices], device=self.device, dtype=torch.long
+        )
+        self._has_target_link = torch.tensor(
+            [mc.target_link is not None for mc in self.motion_configs], device=self.device, dtype=torch.bool
+        )
+
+        # Pre-compute target sampling parameters as tensors
+        self._target_pos_means_t = torch.stack([
+            torch.tensor([mc.target_pos_mean.get(k, 0.0) for k in ["x", "y", "z"]], device=self.device)
+            for mc in self.motion_configs
+        ])
+        self._target_pos_stds_t = torch.stack([
+            torch.tensor([mc.target_pos_std.get(k, 0.0) for k in ["x", "y", "z"]], device=self.device)
+            for mc in self.motion_configs
+        ])
+        self._target_pos_offsets_t = torch.stack([
+            torch.tensor(mc.target_pos_offset, device=self.device, dtype=torch.float32)
+            for mc in self.motion_configs
+        ])
+        self._target_euler_ranges_t = torch.stack([
+            torch.tensor([mc.target_euler_angle_range.get(k, (0.0, 0.0)) for k in ["roll", "pitch", "yaw"]], device=self.device)
+            for mc in self.motion_configs
+        ])  # (num_motions, 3, 2)
+        self._target_offset_quats = torch.stack([
+            quat_from_euler_xyz(
+                torch.tensor([mc.target_euler_angle_offset[0]], device=self.device),
+                torch.tensor([mc.target_euler_angle_offset[1]], device=self.device),
+                torch.tensor([mc.target_euler_angle_offset[2]], device=self.device),
+            ).squeeze(0)
+            for mc in self.motion_configs
+        ])
+        self._target_phase_starts_t = torch.tensor([mc.target_phase_start for mc in self.motion_configs], device=self.device)
+        self._target_phase_ends_t = torch.tensor([mc.target_phase_end for mc in self.motion_configs], device=self.device)
+
         self.which_motion = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
         # Scale factor for target position Gaussian std (0 = no variance, 1 = full variance).
@@ -1476,110 +1534,94 @@ class MultiTargetConditionedMotionCommand(CommandTerm):
             self.target_visualizer = VisualizationMarkers(self.cfg.anchor_visualizer_cfg.replace(prim_path="/Visuals/Command/target"))
     
 
-    def _gather_motion_tensor(self, getter):
-        """Gather per-env data from the active motion for each env (vectorized per motion)."""
-        out = None
-        for i, motion in enumerate(self.motion_loaders):
-            mask = self.which_motion == i
-            if torch.any(mask):
-                data = getter(motion, mask)
-                if out is None:
-                    out = torch.zeros((self.num_envs,) + data.shape[1:], device=self.device, dtype=data.dtype)
-                out[mask] = data
-        return out
-
+    def _clamped_time_steps(self):
+        """Get time steps clamped to valid range per env's active motion."""
+        totals = self._time_step_totals[self.which_motion]
+        return torch.where(self.time_steps >= totals, torch.zeros_like(self.time_steps), self.time_steps)
 
     @property
     def command(self) -> torch.Tensor:
         """Returns joint positions, joint velocities, target position, and target orientation in body frame."""
-        # Transform target position from world frame to body frame
         anchor_pos_w = self.robot.data.body_pos_w[:, self.robot_anchor_body_index]
         anchor_quat_w = self.robot.data.body_quat_w[:, self.robot_anchor_body_index]
         anchor_quat_inv = quat_inv(anchor_quat_w)
         self.target_position_b = quat_apply(anchor_quat_inv, self.target_position_w - anchor_pos_w)
-
-        # Transform target orientation from world frame to body frame
         self.target_orientation_b = quat_mul(anchor_quat_inv, self.target_orientation_w)
+        return torch.cat([self.joint_pos, self.joint_vel, self.target_position_b, self.target_orientation_b], dim=1)
 
-        command_observation = torch.cat([self.joint_pos, self.joint_vel, self.target_position_b, self.target_orientation_b], dim=1)
-        # command_observation = torch.cat([self.joint_pos, self.joint_vel], dim=1)
-
-        # print("Command observation:", command_observation)
-        return command_observation
-    
     @property
     def joint_pos(self) -> torch.Tensor:
-        val = self._gather_motion_tensor(lambda motion, mask: motion.joint_pos[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask])])
+        t = self._clamped_time_steps()
+        val = self._stacked_joint_pos[self.which_motion, t]
         if torch.any(self.is_paused):
             val[self.is_paused] = self._paused_joint_pos[self.is_paused]
         return val
 
     @property
     def joint_vel(self) -> torch.Tensor:
-        val = self._gather_motion_tensor(lambda motion, mask: motion.joint_vel[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask])])
+        t = self._clamped_time_steps()
+        val = self._stacked_joint_vel[self.which_motion, t]
         if torch.any(self.is_paused):
             val[self.is_paused] = self._paused_joint_vel[self.is_paused]
         return val
 
     @property
     def body_pos_w(self) -> torch.Tensor:
-        body_pos = self._gather_motion_tensor(lambda motion, mask: motion.body_pos_w[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask])])
-        body_pos = body_pos + self._env.scene.env_origins[:, None, :]
+        t = self._clamped_time_steps()
+        body_pos = self._stacked_body_pos_w[self.which_motion, t] + self._env.scene.env_origins[:, None, :]
         if torch.any(self.is_paused):
             body_pos[self.is_paused] = self._paused_body_pos_w[self.is_paused]
         return body_pos
 
     @property
     def body_quat_w(self) -> torch.Tensor:
-        val = self._gather_motion_tensor(lambda motion, mask: motion.body_quat_w[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask])])
+        t = self._clamped_time_steps()
+        val = self._stacked_body_quat_w[self.which_motion, t]
         if torch.any(self.is_paused):
             val[self.is_paused] = self._paused_body_quat_w[self.is_paused]
         return val
 
     @property
     def body_lin_vel_w(self) -> torch.Tensor:
-        vel = self._gather_motion_tensor(lambda motion, mask: motion.body_lin_vel_w[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask])])
+        t = self._clamped_time_steps()
+        vel = self._stacked_body_lin_vel_w[self.which_motion, t]
         vel[self.is_paused] = 0.0
         return vel
 
     @property
     def body_ang_vel_w(self) -> torch.Tensor:
-        vel = self._gather_motion_tensor(lambda motion, mask: motion.body_ang_vel_w[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask])])
+        t = self._clamped_time_steps()
+        vel = self._stacked_body_ang_vel_w[self.which_motion, t]
         vel[self.is_paused] = 0.0
         return vel
 
     @property
     def anchor_pos_w(self) -> torch.Tensor:
-        anchor_pos = self._gather_motion_tensor(
-            lambda motion, mask: motion.body_pos_w[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask]), self.motion_anchor_body_index]
-        )
-        anchor_pos = anchor_pos + self._env.scene.env_origins
+        t = self._clamped_time_steps()
+        anchor_pos = self._stacked_body_pos_w[self.which_motion, t, self.motion_anchor_body_index] + self._env.scene.env_origins
         if torch.any(self.is_paused):
             anchor_pos[self.is_paused] = self._paused_body_pos_w[self.is_paused, self.motion_anchor_body_index]
         return anchor_pos
 
     @property
     def anchor_quat_w(self) -> torch.Tensor:
-        val = self._gather_motion_tensor(
-            lambda motion, mask: motion.body_quat_w[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask]), self.motion_anchor_body_index]
-        )
+        t = self._clamped_time_steps()
+        val = self._stacked_body_quat_w[self.which_motion, t, self.motion_anchor_body_index]
         if torch.any(self.is_paused):
             val[self.is_paused] = self._paused_body_quat_w[self.is_paused, self.motion_anchor_body_index]
         return val
 
     @property
     def anchor_lin_vel_w(self) -> torch.Tensor:
-        vel = self._gather_motion_tensor(
-            lambda motion, mask: motion.body_lin_vel_w[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask]), self.motion_anchor_body_index]
-        )
+        t = self._clamped_time_steps()
+        vel = self._stacked_body_lin_vel_w[self.which_motion, t, self.motion_anchor_body_index]
         vel[self.is_paused] = 0.0
         return vel
 
     @property
     def anchor_ang_vel_w(self) -> torch.Tensor:
-        vel = self._gather_motion_tensor(
-            lambda motion, mask: motion.body_ang_vel_w[torch.where(self.time_steps[mask] >= motion.time_step_total, 0, self.time_steps[mask]), self.motion_anchor_body_index]
-        )
+        t = self._clamped_time_steps()
+        vel = self._stacked_body_ang_vel_w[self.which_motion, t, self.motion_anchor_body_index]
         vel[self.is_paused] = 0.0
         return vel
 
@@ -1622,7 +1664,55 @@ class MultiTargetConditionedMotionCommand(CommandTerm):
     @property
     def robot_anchor_ang_vel_w(self) -> torch.Tensor:
         return self.robot.data.body_ang_vel_w[:, self.robot_anchor_body_index]
-    
+
+    def _sample_targets(self, env_ids):
+        """Vectorized target position/orientation sampling for given env_ids."""
+        motion_ids = self.which_motion[env_ids]
+
+        # Handle motions with moving targets
+        has_moving = self._has_target_link[motion_ids]
+        if torch.any(has_moving):
+            moving_env_ids = env_ids[has_moving]
+            moving_motion_ids = motion_ids[has_moving]
+            target_body_idx = self._target_body_indices_t[moving_motion_ids]
+            self.target_position_w[moving_env_ids] = (
+                self.robot.data.body_pos_w[moving_env_ids, target_body_idx]
+                + self._target_pos_offsets_t[moving_motion_ids]
+            )
+            offset_quats = self._target_offset_quats[moving_motion_ids]
+            body_quats = self.robot.data.body_quat_w[moving_env_ids, target_body_idx]
+            self.target_orientation_w[moving_env_ids] = quat_mul(body_quats, offset_quats)
+
+        # Handle motions with static targets
+        has_static = ~has_moving
+        if torch.any(has_static):
+            static_env_ids = env_ids[has_static]
+            static_motion_ids = motion_ids[has_static]
+            ns = len(static_env_ids)
+
+            # Sample position from Gaussian
+            pos_mean = self._target_pos_means_t[static_motion_ids]
+            pos_std = self._target_pos_stds_t[static_motion_ids] * self.target_pos_std_scale
+            rand_pos = pos_mean + torch.randn(ns, 3, device=self.device) * pos_std
+
+            # Sample orientation within range
+            euler_ranges = self._target_euler_ranges_t[static_motion_ids]  # (ns, 3, 2)
+            rand_euler = euler_ranges[:, :, 0] + torch.rand(ns, 3, device=self.device) * (euler_ranges[:, :, 1] - euler_ranges[:, :, 0])
+            rand_quat = quat_from_euler_xyz(rand_euler[:, 0], rand_euler[:, 1], rand_euler[:, 2])
+
+            # Set position in world frame relative to anchor
+            anchor_pos_w = self.robot.data.body_pos_w[static_env_ids, self.robot_anchor_body_index]
+            self.target_position_w[static_env_ids] = rand_pos + anchor_pos_w + self._target_pos_offsets_t[static_motion_ids]
+
+            # Set orientation in world frame relative to anchor
+            anchor_quat_w = self.robot.data.body_quat_w[static_env_ids, self.robot_anchor_body_index]
+            offset_quats = self._target_offset_quats[static_motion_ids]
+            self.target_orientation_w[static_env_ids] = quat_mul(quat_mul(anchor_quat_w, rand_quat), offset_quats)
+
+        # Set phase windows
+        self.target_phase_start[env_ids] = self._target_phase_starts_t[motion_ids]
+        self.target_phase_end[env_ids] = self._target_phase_ends_t[motion_ids]
+
     def _update_metrics(self):
         self.metrics["error_anchor_pos"] = torch.norm(self.anchor_pos_w - self.robot_anchor_pos_w, dim=-1)
         self.metrics["error_anchor_rot"] = quat_error_magnitude(self.anchor_quat_w, self.robot_anchor_quat_w)
@@ -1645,13 +1735,11 @@ class MultiTargetConditionedMotionCommand(CommandTerm):
 
         self.metrics["error_joint_pos"] = torch.norm(self.joint_pos - self.robot_joint_pos, dim=-1)
         self.metrics["error_joint_vel"] = torch.norm(self.joint_vel - self.robot_joint_vel, dim=-1)
-        
+
         # Update target position tracking error
-        source_body_positions = torch.zeros(self.num_envs, 3, device=self.device)
-        for i in range(len(self.motion_configs)):
-            mask = self.which_motion == i
-            if torch.any(mask):
-                source_body_positions[mask] = self.robot.data.body_pos_w[mask, self.source_body_indices[i]]
+        env_arange = torch.arange(self.num_envs, device=self.device)
+        source_idx_per_env = self._source_body_indices_t[self.which_motion]
+        source_body_positions = self.robot.data.body_pos_w[env_arange, source_idx_per_env]
         self.metrics["error_target_pos"] = torch.norm(source_body_positions - self.target_position_w, dim=-1)
 
     def _adaptive_sampling(self, env_ids: Sequence[int]):
@@ -1776,60 +1864,8 @@ class MultiTargetConditionedMotionCommand(CommandTerm):
         )
 
 
-        # Sample target positions and orientations based on the selected motion
-        for i in range(len(self.motion_configs)):
-            motion_mask = self.which_motion[env_ids] == i
-            if not torch.any(motion_mask):
-                continue
-                
-            motion_cfg = self.motion_configs[i]
-            env_indices_for_motion = env_ids[motion_mask]
-            
-            # Check if tracking a moving target link or sampling static position
-            if motion_cfg.target_link:
-                # Track moving target body (e.g., for handoff)
-                target_body_idx = self.target_body_indices[i]
-                self.target_position_w[env_indices_for_motion] = (
-                    self.robot.data.body_pos_w[env_indices_for_motion, target_body_idx] + 
-                    torch.tensor(motion_cfg.target_pos_offset, device=self.device)
-                )
-                
-                # Apply orientation offset
-                offset = torch.tensor(motion_cfg.target_euler_angle_offset, device=self.device)
-                offset_quat = quat_from_euler_xyz(offset[0], offset[1], offset[2])
-                offset_quat_expanded = offset_quat.expand(self.robot.data.body_quat_w[env_indices_for_motion, target_body_idx].shape)
-                self.target_orientation_w[env_indices_for_motion] = quat_mul(
-                    self.robot.data.body_quat_w[env_indices_for_motion, target_body_idx], 
-                    offset_quat_expanded
-                )
-            else:
-                # Sample random target position from Gaussian around nominal mean
-                pos_mean = torch.tensor([motion_cfg.target_pos_mean.get(key, 0.0) for key in ["x", "y", "z"]], device=self.device)
-                pos_std = torch.tensor([motion_cfg.target_pos_std.get(key, 0.0) for key in ["x", "y", "z"]], device=self.device)
-                current_std = pos_std * self.target_pos_std_scale
-                n_samples = motion_mask.sum().item()
-                rand_samples = pos_mean.unsqueeze(0) + torch.randn(n_samples, 3, device=self.device) * current_std.unsqueeze(0)
-                
-                # Sample target orientation within specified range
-                euler_range_list = [motion_cfg.target_euler_angle_range.get(key, (0.0, 0.0)) for key in ["roll", "pitch", "yaw"]]
-                euler_ranges = torch.tensor(euler_range_list, device=self.device)
-                rand_euler = sample_uniform(euler_ranges[:, 0], euler_ranges[:, 1], (motion_mask.sum().item(), 3), device=self.device)
-                rand_quat = quat_from_euler_xyz(rand_euler[:, 0], rand_euler[:, 1], rand_euler[:, 2])
-                
-                # Set target position in world frame relative to robot anchor body
-                anchor_pos_w = self.robot.data.body_pos_w[env_indices_for_motion, self.robot_anchor_body_index]
-                self.target_position_w[env_indices_for_motion] = rand_samples + anchor_pos_w + torch.tensor(motion_cfg.target_pos_offset, device=self.device)
-                
-                # Set target orientation in world frame relative to robot anchor body
-                anchor_quat_w = self.robot.data.body_quat_w[env_indices_for_motion, self.robot_anchor_body_index]
-                offset = torch.tensor(motion_cfg.target_euler_angle_offset, device=self.device)
-                offset_quat = quat_from_euler_xyz(offset[0], offset[1], offset[2])
-                offset_quat_expanded = offset_quat.expand(anchor_quat_w.shape)
-                self.target_orientation_w[env_indices_for_motion] = quat_mul(quat_mul(anchor_quat_w, rand_quat), offset_quat_expanded)
-            
-            # Set target phase window
-            self.target_phase_start[env_indices_for_motion] = motion_cfg.target_phase_start
-            self.target_phase_end[env_indices_for_motion] = motion_cfg.target_phase_end
+        # Sample target positions and orientations (vectorized)
+        self._sample_targets(env_ids)
 
 
     def _sample_next_motion(self, env_ids: Sequence[int]):
@@ -1846,83 +1882,29 @@ class MultiTargetConditionedMotionCommand(CommandTerm):
         self.which_motion[env_ids] = torch.randint(0, len(self.motion_loaders), (len(env_ids),), device=self.device)
         self.time_steps[env_ids] = 0
 
-        # Sample target positions and orientations for the new motions
-        for i in range(len(self.motion_configs)):
-            motion_mask = self.which_motion[env_ids] == i
-            if not torch.any(motion_mask):
-                continue
-
-            motion_cfg = self.motion_configs[i]
-            env_indices_for_motion = env_ids[motion_mask]
-
-            if motion_cfg.target_link:
-                target_body_idx = self.target_body_indices[i]
-                self.target_position_w[env_indices_for_motion] = (
-                    self.robot.data.body_pos_w[env_indices_for_motion, target_body_idx]
-                    + torch.tensor(motion_cfg.target_pos_offset, device=self.device)
-                )
-                offset = torch.tensor(motion_cfg.target_euler_angle_offset, device=self.device)
-                offset_quat = quat_from_euler_xyz(offset[0], offset[1], offset[2])
-                offset_quat_expanded = offset_quat.expand(self.robot.data.body_quat_w[env_indices_for_motion, target_body_idx].shape)
-                self.target_orientation_w[env_indices_for_motion] = quat_mul(
-                    self.robot.data.body_quat_w[env_indices_for_motion, target_body_idx],
-                    offset_quat_expanded,
-                )
-            else:
-                pos_mean = torch.tensor([motion_cfg.target_pos_mean.get(key, 0.0) for key in ["x", "y", "z"]], device=self.device)
-                pos_std = torch.tensor([motion_cfg.target_pos_std.get(key, 0.0) for key in ["x", "y", "z"]], device=self.device)
-                current_std = pos_std * self.target_pos_std_scale
-                n_samples = motion_mask.sum().item()
-                rand_samples = pos_mean.unsqueeze(0) + torch.randn(n_samples, 3, device=self.device) * current_std.unsqueeze(0)
-
-                euler_range_list = [motion_cfg.target_euler_angle_range.get(key, (0.0, 0.0)) for key in ["roll", "pitch", "yaw"]]
-                euler_ranges = torch.tensor(euler_range_list, device=self.device)
-                rand_euler = sample_uniform(euler_ranges[:, 0], euler_ranges[:, 1], (n_samples, 3), device=self.device)
-                rand_quat = quat_from_euler_xyz(rand_euler[:, 0], rand_euler[:, 1], rand_euler[:, 2])
-
-                anchor_pos_w = self.robot.data.body_pos_w[env_indices_for_motion, self.robot_anchor_body_index]
-                self.target_position_w[env_indices_for_motion] = rand_samples + anchor_pos_w + torch.tensor(motion_cfg.target_pos_offset, device=self.device)
-
-                anchor_quat_w = self.robot.data.body_quat_w[env_indices_for_motion, self.robot_anchor_body_index]
-                offset = torch.tensor(motion_cfg.target_euler_angle_offset, device=self.device)
-                offset_quat = quat_from_euler_xyz(offset[0], offset[1], offset[2])
-                offset_quat_expanded = offset_quat.expand(anchor_quat_w.shape)
-                self.target_orientation_w[env_indices_for_motion] = quat_mul(quat_mul(anchor_quat_w, rand_quat), offset_quat_expanded)
-
-            self.target_phase_start[env_indices_for_motion] = motion_cfg.target_phase_start
-            self.target_phase_end[env_indices_for_motion] = motion_cfg.target_phase_end
+        # Sample target positions and orientations (vectorized)
+        self._sample_targets(env_ids)
 
     def _update_command(self):
         """Update command each step: increment time steps, handle motion completion, update target positions for moving targets, and update adaptive tracking."""
         self.time_steps += 1
         
-        # Update target positions for motions that track moving bodies
-        for i in range(len(self.motion_configs)):
-            motion_cfg = self.motion_configs[i]
-            if motion_cfg.target_link:
-                motion_mask = self.which_motion == i
-                if torch.any(motion_mask):
-                    target_body_idx = self.target_body_indices[i]
-                    env_indices = torch.where(motion_mask)[0]
-                    
-                    # Update target position
-                    self.target_position_w[env_indices] = (
-                        self.robot.data.body_pos_w[env_indices, target_body_idx] + 
-                        torch.tensor(motion_cfg.target_pos_offset, device=self.device)
-                    )
-                    
-                    # Update target orientation
-                    offset = torch.tensor(motion_cfg.target_euler_angle_offset, device=self.device)
-                    offset_quat = quat_from_euler_xyz(offset[0], offset[1], offset[2])
-                    offset_quat_expanded = offset_quat.expand(self.robot.data.body_quat_w[env_indices, target_body_idx].shape)
-                    self.target_orientation_w[env_indices] = quat_mul(
-                        self.robot.data.body_quat_w[env_indices, target_body_idx], 
-                        offset_quat_expanded
-                    )
-        
+        # Update target positions for motions that track moving bodies (vectorized)
+        envs_with_moving_target = self._has_target_link[self.which_motion]
+        if torch.any(envs_with_moving_target):
+            env_indices = torch.where(envs_with_moving_target)[0]
+            motion_ids = self.which_motion[env_indices]
+            target_body_idx = self._target_body_indices_t[motion_ids]
+            self.target_position_w[env_indices] = (
+                self.robot.data.body_pos_w[env_indices, target_body_idx]
+                + self._target_pos_offsets_t[motion_ids]
+            )
+            offset_quats = self._target_offset_quats[motion_ids]
+            body_quats = self.robot.data.body_quat_w[env_indices, target_body_idx]
+            self.target_orientation_w[env_indices] = quat_mul(body_quats, offset_quats)
+
         # Check which environments have finished their current motion
-        motion_indices = self.which_motion
-        timestep_limits = torch.tensor([self.motion_loaders[m].time_step_total for m in motion_indices.tolist()], device=self.device)
+        timestep_limits = self._time_step_totals[self.which_motion]
         env_ids_at_end_of_motion = torch.where(self.time_steps >= timestep_limits)[0]
         # Snapshot robot state on first frame of pause (transition from not-paused to paused)
         newly_paused = env_ids_at_end_of_motion[~self.is_paused[env_ids_at_end_of_motion]]
@@ -1993,15 +1975,10 @@ class MultiTargetConditionedMotionCommand(CommandTerm):
         if hasattr(self, "target_visualizer"):
             self.target_visualizer.visualize(self.target_position_w, self.target_orientation_w)
         if hasattr(self, "source_link_visualizer"):
-            source_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
-            source_quat_w = torch.zeros(self.num_envs, 4, device=self.device)
-            source_quat_w[:, 0] = 1.0
-            for i in range(len(self.motion_configs)):
-                mask = self.which_motion == i
-                if torch.any(mask):
-                    source_body_idx = self.source_body_indices[i]
-                    source_pos_w[mask] = self.robot.data.body_pos_w[mask, source_body_idx]
-                    source_quat_w[mask] = self.robot.data.body_quat_w[mask, source_body_idx]
+            env_arange = torch.arange(self.num_envs, device=self.device)
+            source_idx = self._source_body_indices_t[self.which_motion]
+            source_pos_w = self.robot.data.body_pos_w[env_arange, source_idx]
+            source_quat_w = self.robot.data.body_quat_w[env_arange, source_idx]
             self.source_link_visualizer.visualize(source_pos_w, source_quat_w)
 
 

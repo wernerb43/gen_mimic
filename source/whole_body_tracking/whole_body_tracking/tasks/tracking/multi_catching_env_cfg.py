@@ -99,65 +99,72 @@ class CommandsCfg:
         joint_position_range=(-0.1, 0.1),
         # Per-motion source and target link names
         # source_link_names=["left_palm_link", "left_palm_link", "left_palm_link", "left_palm_link", "right_palm_link"],
-        source_link_names=["left_palm_link", "left_palm_link", "left_palm_link"],
-        target_link_names=[None, None, None],  # None means sample static position
-        # source_link_names=["left_palm_link"],
-        # target_link_names=[None],
+        # source_link_names=["left_palm_link", "left_palm_link", "left_palm_link"],
+        # target_link_names=[None, None, None],  # None means sample static position
+        source_link_names=["right_palm_link"],
+        target_link_names=[None],
 
         # Per-motion nominal target positions (mean of Gaussian)
         target_pos_means=[
             # {"x": 0.0, "y": 0.0, "z": 0.0},  # Throw - no target position tracking
-            {"x": 0.3, "y": -0.40, "z": 0.3},  # Right catch
-            {"x": 0.3, "y": 0.40, "z": 0.3},   # Left catch
-            {"x": 0.3, "y": -0.10, "z": 0.4},   # Middle catch
+            # {"x": 0.3, "y": -0.40, "z": 0.3},  # Right catch
+            # {"x": 0.3, "y": 0.40, "z": 0.3},   # Left catch
+            # {"x": 0.3, "y": -0.10, "z": 0.4},   # Middle catch
             # {"x": 0.0, "y": 0.0, "z": 0.0},  # Handoff
+            {"x": 0.4807, "y": -0.0159, "z": 0.0493},  # Forehand
         ],
         # Per-motion target position standard deviations (max, scaled by curriculum)
         target_pos_stds=[
             # {"x": 0.0, "y": 0.0, "z": 0.0},  # Throw
-            {"x": 0.05, "y": 0.2, "z": 0.1},  # Right catch
-            {"x": 0.05, "y": 0.2, "z": 0.1},  # Left catch
-            {"x": 0.05, "y": 0.2, "z": 0.1},  # Middle catch
+            # {"x": 0.05, "y": 0.2, "z": 0.1},  # Right catch
+            # {"x": 0.05, "y": 0.2, "z": 0.1},  # Left catch
+            # {"x": 0.05, "y": 0.2, "z": 0.1},  # Middle catch
             # {"x": 0.0, "y": 0.0, "z": 0.0},  # Handoff
+            {"x": 0.05, "y": 0.15, "z": 0.15},  # Forehand
         ],
         # Per-motion target orientation ranges
         target_euler_angle_ranges=[
             # {"roll": (0.0, 0.0), "pitch": (0.0, 0.0), "yaw": (0.0, 0.0)},  # Throw
-            {"roll": (0.0, 0.0), "pitch": (0.0, 0.0), "yaw": (0.0, 0.0)},  # Right catch
-            {"roll": (0.0, 0.0), "pitch": (0.0, 0.0), "yaw": (0.0, 0.0)},  # Left catch
-            {"roll": (0.0, 0.0), "pitch": (0.0, 0.0), "yaw": (0.0, 0.0)},  # Middle catch
+            # {"roll": (0.0, 0.0), "pitch": (0.0, 0.0), "yaw": (0.0, 0.0)},  # Right catch
+            # {"roll": (0.0, 0.0), "pitch": (0.0, 0.0), "yaw": (0.0, 0.0)},  # Left catch
+            # {"roll": (0.0, 0.0), "pitch": (0.0, 0.0), "yaw": (0.0, 0.0)},  # Middle catch
             # {"roll": (0.0, 0.0), "pitch": (0.0, 0.0), "yaw": (0.0, 0.0)},  # Handoff 
+            {"roll": (0.0, 0.0), "pitch": (0.0, 0.0), "yaw": (0.0, 0.0)},  # Forehand
         ],
         # Per-motion position offsets
         target_pos_offsets=[
             # (0.0, 0.0, 0.0),  # Throw
-            (0.0, 0.0, 0.0),  # Right catch
-            (0.0, 0.0, 0.0),  # Left catch
-            (0.0, 0.0, 0.0),  # Middle catch
+            # (0.0, 0.0, 0.0),  # Right catch
+            # (0.0, 0.0, 0.0),  # Left catch
+            # (0.0, 0.0, 0.0),  # Middle catch
             # (0.0, 0.0, 0.0),  # Handoff
+            (0.0, 0.0, 0.0),  # Forehand
         ],
         # Per-motion orientation offsets
         target_euler_angle_offsets=[
             # (0.0, 0.0, 0.0),  # Throw
-            (0.0, 0.0, 1.5708),  # Right catch
-            (0.0, 0.0, 1.5708),  # Left catch
-            (0.0, 0.0, 1.5708),  # Middle catch
+            # (0.0, 0.0, 1.5708),  # Right catch
+            # (0.0, 0.0, 1.5708),  # Left catch
+            # (0.0, 0.0, 1.5708),  # Middle catch
             # (0.0, 3.1415, 0.0),  # Handoff
+            (0.0, 0.0, 1.5708),  # Forehand
         ],
         # Per-motion phase windows
         target_phase_starts=[
             # 0.0,    # Throw
-            0.433,  # Right catch
-            0.356,  # Left catch
-            0.345,  # Middle catch
+            # 0.433,  # Right catch
+            # 0.356,  # Left catch
+            # 0.345,  # Middle catch
             # 0.45,  # Handoff
+            0.322  #  Forehand
         ],
         target_phase_ends=[
             # 1.0,    # Throw
-            0.686,  # Right catch
-            0.666,  # Left catch
-            0.636,  # Middle catch
+            # 0.686,  # Right catch
+            # 0.666,  # Left catch
+            # 0.636,  # Middle catch
             # 0.55,  # Handoff
+            0.327  #  Forehand
         ],
     )
 
@@ -256,6 +263,20 @@ class EventCfg:
         params={"velocity_range": VELOCITY_RANGE},
     )
 
+    push_body = EventTerm(
+        func=mdp.apply_force_in_direction_during_contact,
+        mode="interval",
+        interval_range_s=(0.01, 0.01),
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=["right_palm_link"]),
+            "force_range": (100.0, 200.0),
+            "direction": (0.0, -1.0, 0.0),
+            "command_name": "multi_target_motion",
+            "motion_index": 0,
+            "force_duration_s": 0.05,
+        },
+    )
+
 
 @configclass
 class RewardsCfg:
@@ -314,25 +335,25 @@ class RewardsCfg:
     # Target position reward for all motions (per_motion_weights: [right_catch, left_catch, middle_catch])
     target_position_reward = RewTerm(
         func=mdp.all_motions_target_position_error_exp,
-        weight=20.0,
+        weight=100.0,
         params={
             "target_command_name": "multi_target_motion",
             "std": 0.3,
-            "per_motion_weights": [1.0, 1.0, 1.0],
+            "per_motion_weights": [1.0],
         },
     )
 
     # Target orientation axis-alignment reward for all motions
-    target_orientation_reward = RewTerm(
-        func=mdp.all_motions_target_orientation_axis_alignment_error_exp,
-        weight=5.0,
-        params={
-            "target_command_name": "multi_target_motion",
-            "std": 1.0,
-            "axis": "y",
-            "per_motion_weights": [1.0, 1.0, 1.0],
-        },
-    )
+    # target_orientation_reward = RewTerm(
+    #     func=mdp.all_motions_target_orientation_axis_alignment_error_exp,
+    #     weight=5.0,
+    #     params={
+    #         "target_command_name": "multi_target_motion",
+    #         "std": 1.0,
+    #         "axis": "y",
+    #         "per_motion_weights": [1.0, 1.0, 1.0],
+    #     },
+    # )
 
 
 
